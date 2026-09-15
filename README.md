@@ -107,6 +107,9 @@ NVIDIA driver and NVIDIA Container Toolkit; see the guide's host requirements.
 
 ### Native Python environment
 
+For the shared CPFS base image and its PPU training nodes, use the
+[native PPU environment guide](assets/openwam_usage_docs/native-ppu.md).
+
 Create an environment with **conda**:
 
 ```bash
