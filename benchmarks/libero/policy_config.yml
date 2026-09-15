@@ -31,9 +31,9 @@ image_transform: rotate_180
 
 # The server-side checkpoint must have been trained from
 # configs/dataloader/libero.yaml. It returns raw native-action
-# EEF10 after normalization/unification is inverted server-side.
+# action7 after normalization is inverted server-side; state input is raw state8.
 action_mode: eef
-state_dim: 10
+state_dim: 8
 send_state: true
 action_indices: null
 action_clip: null

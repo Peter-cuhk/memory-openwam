@@ -1,19 +1,7 @@
-"""Normalization statistics for the converted native-action LIBERO dataset.
+"""Training-split statistics for LIBERO action7/state8.
 
-Scans every ``data/**/*.parquet`` row of an already-converted EEF10 LIBERO
-dataset (columns ``action`` / ``observation.state``) and writes the same
-payload the retired EEF10 converter used to emit alongside the conversion:
-separate action / state blocks with exact moments, min/max, quantiles, and the
-rot6d dims (3:9) pinned to identity.
-
-Default output (the libero.yaml convention, auto-built by the reader on first
-use — rank 0 computes, other ranks wait):
-
-    <dataset_dir>/meta/libero_normalization_stats.npy
-
-CLI:
-    python -m openwam.dataloader.utils.stats_computation.libero_stats_computation \\
-        --dataset-dir /path/to/benchmark_data/libero
+Action and state are measured independently; rotation vectors are normalized
+like other continuous dimensions, without changing their representation.
 """
 
 from __future__ import annotations
@@ -27,17 +15,23 @@ import numpy as np
 import pyarrow.parquet as pq
 
 from openwam.dataloader.libero import (
+    ACTION_DIM,
     ACTION_STATS_KEY,
     GRIPPER_CONVENTION,
     NORMALIZATION_STATS_FILENAME,
     OUTPUT_REPRESENTATION,
+    STATE_DIM,
     STATE_STATS_KEY,
+)
+from openwam.dataloader.utils.lerobotv3 import (
+    apply_info_splits,
+    compute_file_local_offsets,
+    load_episodes_parquet,
+    parse_info_json,
 )
 
 ACTION_COLUMN = "action"
 STATE_COLUMN = "observation.state"
-ROT6D_DIMS = tuple(range(3, 9))
-
 
 def _feature_stats(values: np.ndarray) -> dict[str, list]:
     values = np.asarray(values)
@@ -58,36 +52,38 @@ def _feature_stats(values: np.ndarray) -> dict[str, list]:
     }
 
 
-def _pin_rot6d_identity(stats: dict) -> None:
-    identity = {"min": -1.0, "max": 1.0, "q01": -1.0, "q99": 1.0, "mean": 0.0, "std": 1.0}
-    for key, value in identity.items():
-        for dim in ROT6D_DIMS:
-            stats[key][dim] = value
-
-
 def _load_columns(dataset_dir: Path) -> tuple[np.ndarray, np.ndarray]:
-    parquet_files = sorted((dataset_dir / "data").rglob("*.parquet"))
-    if not parquet_files:
-        raise FileNotFoundError(f"no parquet files under {dataset_dir / 'data'}")
+    info = parse_info_json(dataset_dir)
+    episodes = load_episodes_parquet(dataset_dir)
+    # Compute offsets BEFORE filtering: validation episodes may share a shard.
+    episodes["_file_offset"] = compute_file_local_offsets(episodes, "data/chunk_index", "data/file_index")
+    episodes = apply_info_splits(episodes, "train", info.get("splits", {}), source_name="LIBERO stats")
+    if episodes.empty:
+        raise ValueError("LIBERO statistics require a non-empty train split")
     actions, states = [], []
-    for path in parquet_files:
+    for (chunk, file), group in episodes.groupby(["data/chunk_index", "data/file_index"]):
+        path = dataset_dir / info["data_path"].format(chunk_index=int(chunk), file_index=int(file))
         table = pq.read_table(path, columns=[ACTION_COLUMN, STATE_COLUMN])
-        actions.append(np.stack(table.column(ACTION_COLUMN).to_pylist()).astype(np.float32))
-        states.append(np.stack(table.column(STATE_COLUMN).to_pylist()).astype(np.float32))
+        for offset, length in zip(group["_file_offset"], group["length"]):
+            window = table.slice(int(offset), int(length))
+            for column, dim, output in ((ACTION_COLUMN, ACTION_DIM, actions), (STATE_COLUMN, STATE_DIM, states)):
+                values = np.asarray(window.column(column).to_pylist(), dtype=np.float32)
+                if values.shape != (int(length), dim) or not np.isfinite(values).all():
+                    raise ValueError(f"{path}:{column} requires {length} rows of {dim} finite values")
+                output.append(values)
     return np.concatenate(actions, axis=0), np.concatenate(states, axis=0)
 
 
 def compute_libero_stats(dataset_dir: str | Path) -> dict:
-    """Full-corpus scan of the converted dataset's EEF10 action/state columns."""
+    """Scan training episodes only, using independent action and state statistics."""
     action_all, state_all = _load_columns(Path(dataset_dir))
     action_stats = _feature_stats(action_all)
     state_stats = _feature_stats(state_all)
-    _pin_rot6d_identity(action_stats)
-    _pin_rot6d_identity(state_stats)
     action_stats.update(
         {
             "num_timesteps": int(action_all.shape[0]),
             "pool": "action_only",
+            "split": "train",
             "gripper_convention": GRIPPER_CONVENTION,
             "representation": OUTPUT_REPRESENTATION,
             "action_semantics": "native normalized LIBERO delta command",
@@ -97,9 +93,10 @@ def compute_libero_stats(dataset_dir: str | Path) -> dict:
         {
             "num_timesteps": int(state_all.shape[0]),
             "pool": "state_only",
-            "gripper_convention": GRIPPER_CONVENTION,
+            "split": "train",
+            "gripper_convention": "two_finger_joint_positions_meters",
             "representation": OUTPUT_REPRESENTATION,
-            "state_semantics": "achieved EEF pose",
+            "state_semantics": "EEF xyz, axis-angle radians, two gripper joint positions",
         }
     )
     return {ACTION_STATS_KEY: action_stats, STATE_STATS_KEY: state_stats}
@@ -125,7 +122,7 @@ def build_and_save_libero_stats(dataset_dir: str | Path, output: str | Path | No
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--dataset-dir", required=True, help="Converted native-action LIBERO dataset root")
+    parser.add_argument("--dataset-dir", required=True, help="LIBERO LeRobot v3 dataset root")
     parser.add_argument(
         "--output",
         default=None,

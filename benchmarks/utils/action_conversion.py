@@ -412,30 +412,27 @@ def base_pose_planar5(base_pose: np.ndarray) -> np.ndarray:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def quat_xyzw_to_axis_angle(quat: np.ndarray) -> np.ndarray:
-    """Convert an xyzw quaternion to a 3-D axis-angle (rotation vector ``axis * angle``).
+def quat_xyzw_to_axis_angle(quat: np.ndarray, *, canonical: bool = True) -> np.ndarray:
+    """Convert an xyzw quaternion to a rotation vector in radians.
 
-    Matches the robosuite ``quat2axisangle`` convention: feeding the result
-    back through ``axisangle2quat`` reproduces the same orientation. The
-    hemisphere is
-    normalized (``w >= 0``) so the returned vector is the minimal rotation
-    (``|angle| <= pi``); both hemispheres map to the same physical rotation.
+    ``canonical=True`` uses SciPy's shortest-rotation convention. Use
+    ``canonical=False`` for LIBERO recorded states: robosuite's quat2axisangle
+    preserves the input quaternion hemisphere and can return angles above pi.
+    SciPy as_rotvec has no noncanonical option, so that convention is implemented
+    here only. It expects the simulator's unit quaternion, like robosuite.
     """
-    q = np.asarray(quat, dtype=np.float64).reshape(-1)
-    if q.shape[0] != 4:
-        raise ValueError(f"quat must be 4-D xyzw, got shape {q.shape}")
-    n = np.linalg.norm(q)
-    if n < 1e-8:
+    q = np.asarray(quat, dtype=np.float64).reshape(4)
+    if canonical:
+        from scipy.spatial.transform import Rotation
+
+        return Rotation.from_quat(q).as_rotvec().astype(np.float32)
+
+    # robosuite quat2axisangle: clip w without flipping the quaternion sign.
+    w = np.clip(q[3], -1.0, 1.0)
+    den = np.sqrt(1.0 - w * w)
+    if den == 0.0:
         return np.zeros(3, dtype=np.float32)
-    q = q / n
-    if q[3] < 0.0:  # shortest-path hemisphere: angle in [0, pi]
-        q = -q
-    v = q[:3]
-    vn = np.linalg.norm(v)
-    if vn < 1e-8:  # identity rotation
-        return np.zeros(3, dtype=np.float32)
-    angle = 2.0 * np.arctan2(vn, q[3])
-    return ((v / vn) * angle).astype(np.float32)
+    return (q[:3] * (2.0 * np.arccos(w) / den)).astype(np.float32)
 
 
 def rot6d_to_axis_angle(r6d: np.ndarray) -> np.ndarray:

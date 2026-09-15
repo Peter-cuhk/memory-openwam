@@ -1,13 +1,8 @@
-"""OpenWAM policy client for canonical native-action LIBERO checkpoints.
+"""LIBERO policy client: raw action7 output and state8 input.
 
-The checkpoint returns raw 10-D native-action EEF values::
-
-    [delta_xyz3, rot6d(Exp(delta_axis_angle3)), open_scale_gripper1]
-
-The adapter converts only that representation to LIBERO's runtime 7-D OSC
-command.  It does not compose with the current EEF pose and does not apply the
-controller's 0.05 m / 0.5 rad output scales.  The live observation sent to the
-server is achieved EEF10, matching the canonical training reader.
+The server reverses training normalization. The client passes the six native
+OSC command coordinates through and converts the 0/1 open flag to +/-1 control.
+State rotation uses robosuite's non-hemisphere-canonicalized axis-angle convention.
 """
 
 from __future__ import annotations
@@ -22,38 +17,41 @@ from benchmarks.utils import (
     WSPolicyClient,
     build_payload,
     encode_numpy_b64,
-    libero_obs_to_eef10,
-    libero_open_scale_to_gripper_cmd,
+    quat_xyzw_to_axis_angle,
     resize_for_lshape_slot,
 )
-from benchmarks.utils.action_conversion import rot6d_to_axis_angle
 
 LIBERO_ACTION_MODE = "eef"
-LIBERO_EEF10_DIM = 10
+LIBERO_STATE_DIM = 8
 LIBERO_ACTION7_DIM = 7
 PROPRIO_OBS_KEYS = ("robot0_eef_pos", "robot0_eef_quat", "robot0_gripper_qpos")
 
 
-def native_eef10_to_libero7d(action: np.ndarray, *, clip: bool = True) -> np.ndarray:
-    """Convert native-action EEF10 to LIBERO's runtime 7-D OSC command.
-
-    ``action[:3]`` and the decoded rotation vector stay in native normalized
-    command space.  The only semantic projection is the gripper sign flip from
-    OpenWAM's ``-1 closed / +1 open`` to LIBERO's ``+1 close / -1 open``.
-    """
-    value = np.asarray(action, dtype=np.float32).reshape(-1)
-    if value.shape != (LIBERO_EEF10_DIM,):
-        raise ValueError(f"expected a native LIBERO EEF10 action, got {value.shape}")
+def libero_action_to_command(action: np.ndarray, *, clip: bool = True) -> np.ndarray:
+    """Preserve native OSC coordinates; threshold the gripper open flag at 0.5."""
+    value = np.asarray(action, dtype=np.float32).reshape(-1).copy()
+    if value.shape != (LIBERO_ACTION7_DIM,):
+        raise ValueError(f"expected a LIBERO action7, got {value.shape}")
     if not np.isfinite(value).all():
-        raise ValueError("native LIBERO EEF10 action contains NaN or infinity")
-    position = value[:3].copy()
-    rotation = rot6d_to_axis_angle(value[3:9]).astype(np.float32)
-    gripper = np.array([libero_open_scale_to_gripper_cmd(value[9])], dtype=np.float32)
+        raise ValueError("LIBERO action contains NaN or infinity")
+    value[6] = -1.0 if value[6] > 0.5 else 1.0
     if clip:
-        position = np.clip(position, -1.0, 1.0)
-        rotation = np.clip(rotation, -1.0, 1.0)
-        gripper = np.clip(gripper, -1.0, 1.0)
-    return np.concatenate([position, rotation, gripper]).astype(np.float32)
+        value[:6] = np.clip(value[:6], -1.0, 1.0)
+    return value
+
+
+def libero_obs_to_state8(obs: dict) -> np.ndarray:
+    """Match robosuite quat2axisangle, including angles above pi.
+
+    Flipping negative-w quaternions to the shortest rotation would produce a
+    different state representation from the stored training coordinates.
+    """
+    rotvec = quat_xyzw_to_axis_angle(obs["robot0_eef_quat"], canonical=False)
+    return np.concatenate((
+        np.asarray(obs["robot0_eef_pos"]).reshape(3),
+        rotvec,
+        np.asarray(obs["robot0_gripper_qpos"]).reshape(2),
+    )).astype(np.float32)
 
 
 def _as_list(value) -> list[float]:
@@ -74,7 +72,7 @@ def _build_state(obs: dict, keys: Iterable[str]) -> list[float]:
 
 
 class OpenWAMLiberoPolicy:
-    """WebSocket policy client for the canonical native-action contract."""
+    """WebSocket policy client for the LIBERO contract."""
 
     def __init__(
         self,
@@ -88,7 +86,7 @@ class OpenWAMLiberoPolicy:
         image_transform: str = "rotate_180",
         send_state: bool = True,
         state_keys: list[str] | None = None,
-        state_dim: int | None = LIBERO_EEF10_DIM,
+        state_dim: int | None = LIBERO_STATE_DIM,
         action_dim: int = LIBERO_ACTION7_DIM,
         action_indices: list[int] | None = None,
         action_clip: float | None = None,
@@ -133,7 +131,7 @@ class OpenWAMLiberoPolicy:
             )
         print(
             f"[OpenWAMLiberoPolicy] server=ws://{host}:{port} "
-            f"action_mode={LIBERO_ACTION_MODE} model_action_dim={LIBERO_EEF10_DIM} "
+            f"action_mode={LIBERO_ACTION_MODE} model_action_dim={LIBERO_ACTION7_DIM} "
             f"runtime_action_dim={self._action_dim} image_transform={image_transform} send_state={send_state}"
         )
 
@@ -159,12 +157,12 @@ class OpenWAMLiberoPolicy:
         model_action = np.asarray(response["action"], dtype=np.float32).reshape(-1)
         if self._action_indices is not None:
             model_action = model_action[self._action_indices]
-        if model_action.shape != (LIBERO_EEF10_DIM,):
+        if model_action.shape != (LIBERO_ACTION7_DIM,):
             raise ValueError(
-                f"OpenWAM returned action dim {model_action.shape[0]}, expected {LIBERO_EEF10_DIM} "
-                "raw native-delta EEF10 values"
+                f"OpenWAM returned action dim {model_action.shape[0]}, expected {LIBERO_ACTION7_DIM} "
+                "raw LIBERO action7 values"
             )
-        action = native_eef10_to_libero7d(model_action)
+        action = libero_action_to_command(model_action)
         if self._action_clip is not None:
             action = np.clip(action, -float(self._action_clip), float(self._action_clip))
         self._maybe_debug(obs, payload, model_action, action)
@@ -191,11 +189,7 @@ class OpenWAMLiberoPolicy:
         if not self._send_state:
             return None
         if all(key in obs for key in PROPRIO_OBS_KEYS):
-            state = libero_obs_to_eef10(
-                obs["robot0_eef_pos"],
-                obs["robot0_eef_quat"],
-                obs["robot0_gripper_qpos"],
-            ).tolist()
+            state = libero_obs_to_state8(obs).tolist()
         else:
             state = _build_state(obs, self._state_keys)
         if self._state_dim is not None and len(state) != int(self._state_dim):
@@ -211,8 +205,8 @@ class OpenWAMLiberoPolicy:
             "action_mode": LIBERO_ACTION_MODE,
             "state_dim": len(payload.get("state", [])) if payload.get("state") is not None else None,
             "state": payload.get("state"),
-            "native_eef10_action": model_action.tolist(),
-            "libero_action7": action.tolist(),
+            "model_action": model_action.tolist(),
+            "libero_command": action.tolist(),
             "obs_keys": sorted(obs.keys()),
         }
         (step_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
@@ -221,7 +215,8 @@ class OpenWAMLiberoPolicy:
 __all__ = [
     "LIBERO_ACTION7_DIM",
     "LIBERO_ACTION_MODE",
-    "LIBERO_EEF10_DIM",
+    "LIBERO_STATE_DIM",
+    "libero_obs_to_state8",
     "OpenWAMLiberoPolicy",
-    "native_eef10_to_libero7d",
+    "libero_action_to_command",
 ]

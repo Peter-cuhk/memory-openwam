@@ -3,11 +3,11 @@
 from .openwam2libero_interface import (
     LIBERO_ACTION_MODE,
     OpenWAMLiberoPolicy,
-    native_eef10_to_libero7d,
+    libero_action_to_command,
 )
 
 __all__ = [
     "LIBERO_ACTION_MODE",
     "OpenWAMLiberoPolicy",
-    "native_eef10_to_libero7d",
+    "libero_action_to_command",
 ]

@@ -1,46 +1,39 @@
 type: libero
 
-# Canonical LIBERO dataset. The reader accepts only the native-action
-# conversion metadata (meta/conversion.json).
-dataset_dir: /path/to/libero_data
+# LeRobot v3 LIBERO; no conversion.json or EEF10 conversion required.
+dataset_dir: /mnt/cpfs/Data/LIBERO-fastwam
 
-# ── Action space ─────────────────────────────────────────────────────────────
-# Normalize action and achieved state from their separate native-action stats
-# blocks, then scatter both 10-D streams into the canonical left-arm slots.
-# Rot6d slots (3:9) are always identity-mapped by the canonical reader; this
-# is enforced even if a stale/custom stats file contains non-identity values.
-# The benchmark bridge decodes the model's native 10-D action to LIBERO's
-# runtime 7-D OSC command without absolute-goal composition or controller
-# scale.
+# action: [delta xyz3, delta rotation command3, gripper open 0/1] (7-D)
+# observation.state: [EEF xyz3, axis-angle3, finger qpos2] (8-D)
+# The stored roll/pitch/yaw labels denote axis-angle coordinates, NOT Euler.
 action_mode: eef
-unify_action: true
-unify_action_map: ["0-9"]
-unify_state_map: null  # null = state reuses unify_action_map
+# 启用 unify 时须分别指定 7 维 action 和 8 维 state 的目标槽位，模型维度均设为 80。
+# 例如 unify_action_map: ["0-6"]，unify_state_map: ["0-7"]。
+unify_action: false
+unify_action_map: null
+unify_state_map: null
 
-# ── Frame sampling ───────────────────────────────────────────────────────────
-# num_frames = state/action window length; action horizon = num_frames - 1.
-# video_stride subsamples video only; state/action stay at the raw rate.
-# window_stride = sliding window step (1 = every frame starts a window).
+# Source FPS is read from meta/info.json; video_stride subsamples video only.
+# action[t] starts at image[t]/state[t]; no +1 shift.
+# 33 source timesteps -> 9 video frames, 32 actions, initial state as proprio input.
 num_frames: 33
 video_stride: 4
 window_stride: 1
 split: train
 
-# ── Rendering (3-slot L-shape canvas) ────────────────────────────────────────
-# camera_layout = [head, left/bottom-left, right/bottom-right]; null slots are
-# rendered as black tiles. At 384x320: top 256Hx320W, bottom halves 128Hx160W,
-# each tile BILINEAR-stretched to its slot. target_camera drives single-view
-# mode and is ignored when multiview=true.
+# L-shape: head 256x320, wrist 128x160 bottom-left, black bottom-right.
 height: 384
 width: 320
 multiview: true
-camera_layout: [observation.images.image, observation.images.image2, null]
-target_camera: observation.images.image
+camera_layout: [observation.images.image, observation.images.wrist_image, null]
+target_camera: null  # used only for single-view mode
 
-# ── Normalization ────────────────────────────────────────────────────────────
-# Stats live at <dataset_dir>/meta/libero_normalization_stats.npy and are
-# auto-built on first use (rank 0 scans, other ranks wait).
+# Independent per-dimension action/state stats, including axis-angle coords.
+# Options: min-max, z-score, quantile, null (disabled).
+# Default stats: <dataset_dir>/meta/libero_normalization_stats.npy.
+# Missing stats are generated from the TRAIN split only by rank 0.
 normalize_mode: min-max
+normalization_stats_path: /mnt/cpfs/feiyang/code/OpenWAM/assets/benchmark_data/libero/meta/libero_normalization_stats.npy
 
 # ── Video augmentation (optional) ────────────────────────────────────────────
 # Load-time color jitter applied by the reader to each clip with the SAME
@@ -52,3 +45,6 @@ color_jitter:
   contrast: 0.2
   saturation: 0.2
   hue: 0.0
+
+# Run scripts/precompute_t5_embeddings.py first; null uses online T5 encoding.
+text_embedding_cache_path: /mnt/cpfs/feiyang/cache/openwam/libero/t5_embeddings.pt

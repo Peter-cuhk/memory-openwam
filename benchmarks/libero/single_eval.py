@@ -157,7 +157,7 @@ def run_eval(cfg: dict) -> int:
         right_wrist_camera_key=cfg.get("right_wrist_camera_key"),
         image_transform=cfg.get("image_transform", "rotate_180"),
         send_state=_require_bool(cfg.get("send_state", True), "send_state"),
-        state_dim=int(cfg.get("state_dim", 10)),
+        state_dim=int(cfg.get("state_dim", 8)),
         action_dim=7,
         action_indices=cfg.get("action_indices"),
         action_clip=cfg.get("action_clip"),

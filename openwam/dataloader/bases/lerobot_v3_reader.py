@@ -268,11 +268,13 @@ class LeRobotV3Reader(BaseDataset):
             self._unify_dst_index = parse_unify_spec(spec, self._unify_dim)
             state_spec = unify_state_map if unify_state_map is not None else spec
             self._unify_state_dst_index = parse_unify_spec(state_spec, self._unify_dim)
-            if self._unify_state_dst_index.shape[0] != self._raw_action_dim:
+            # Readers may declare a different raw state width (LIBERO: action7/state8).
+            raw_state_dim = int(getattr(self, "STATE_DIM", self._raw_action_dim))
+            if self._unify_state_dst_index.shape[0] != raw_state_dim:
                 raise ValueError(
                     f"{self.DATASET_NAME} unify_state_map maps "
                     f"{self._unify_state_dst_index.shape[0]} source dims but this reader emits "
-                    f"{self._raw_action_dim}-D state"
+                    f"{raw_state_dim}-D state"
                 )
             if self._unify_dst_index.shape[0] != self._raw_action_dim:
                 raise ValueError(

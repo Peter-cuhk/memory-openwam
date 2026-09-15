@@ -1,0 +1,58 @@
+# 本机 LIBERO 训练配置。先 source scripts/env.sh，执行：
+# NPROC_PER_NODE=1 bash scripts/train.sh --config-name train_libero
+# 仅检查配置（不加载数据、权重或设备）：
+# python scripts/train.py --config-name train_libero --cfg job
+# 可加 --resolve 展开 ${...} 引用。
+defaults:
+  - train
+  - override model: dual_system
+  - override dataloader: libero
+  - _self_
+
+model:
+  video_backbone:
+    # Wan2.2-TI2V-5B 权重目录。
+    model_path: /mnt/cpfs/feiyang/checkpoints/Wan2.2-TI2V-5B
+    from_scratch: false
+    encoder:
+      model_path: ${model.video_backbone.model_path}
+  architecture:
+    # framework 由上面的 model 配置组决定；切换组时同时选择该组支持的 variant。
+    variant: joint_self_attn
+    action_dim: 7
+    state_dim: 8
+    use_proprioception: true
+
+training:
+  # 起步配置，显存占用仍需在实际 PPU 节点验证。
+  debug: false
+  batch_size: 1                    # 每卡每个 micro-step 的样本数
+  gradient_accumulation_steps: 4   # 有效 batch = 卡数 × batch_size × 累积步数
+  dataset_num_workers: 4
+  learning_rate: 1e-4
+  num_epochs: 5
+  max_steps: null                  # 如设置，单位为 micro-step，非 optimizer step
+  mixed_precision: bf16
+  zero_stage: 2
+  use_gradient_checkpointing: true
+  offload_optimizer_device: none
+  # 两者为 null：加载 Wan 骨干，初始化新的动作模型。
+  # 微调 OpenWAM checkpoint 填 finetune；恢复完整训练状态填 resume，二选一。
+  finetune_ckpt_path: null
+  resume_ckpt_path: null
+  output_path: /mnt/cpfs/feiyang/code/OpenWAM/outputs/libero/checkpoints
+  save_steps: 1000
+  keep_last_k_ckpts: 2
+  save_full_states_for_resume: false  # 需要中断后精确恢复时改为 true，额外保存优化器状态
+
+project:
+  name: libero
+  seed: 42
+  output_dir: /mnt/cpfs/feiyang/code/OpenWAM/outputs/libero/logs/${now:%Y-%m-%d_%H-%M-%S}
+  wandb:
+    project: libero
+    run_name: libero
+
+hydra:
+  run:
+    dir: ${project.output_dir}
