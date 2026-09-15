@@ -22,7 +22,6 @@ export WANDB_CACHE_DIR="${OPENWAM_CACHE_ROOT}/wandb"
 export WANDB_CONFIG_DIR="${WANDB_CACHE_DIR}/config"
 export WANDB_DIR="${OPENWAM_ROOT}/outputs"
 export WANDB_MODE="${WANDB_MODE:-offline}"
-export TMPDIR="${OPENWAM_CACHE_ROOT}/tmp"
 export UV_LINK_MODE=copy
 export UV_PYTHON_DOWNLOADS=never
 export PYTHONNOUSERSITE=1
