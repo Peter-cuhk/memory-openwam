@@ -24,6 +24,26 @@ from openwam.model.video_backbone.wan.shared.models.model_loader import ModelPoo
 
 logger = logging.getLogger(__name__)
 
+
+def is_text_encoder_config(config) -> bool:
+    """Identify the standalone Wan UMT5 checkpoint before loading tensors."""
+    path = config.path
+    return isinstance(path, (str, os.PathLike)) and os.path.basename(path).startswith("models_t5_")
+
+
+def load_text_components(model_path: str, device="cpu") -> SimpleNamespace:
+    """Load only Wan's frozen T5 and tokenizer, for precompute or deployment."""
+    from openwam.model.video_backbone.wan.pipeline_builder import discover_model_files
+
+    configs, tokenizer = discover_model_files(model_path)
+    configs = [c for c in configs if is_text_encoder_config(c)]
+    if len(configs) != 1:
+        raise ValueError(f"Expected one Wan T5 checkpoint under {model_path}, found {len(configs)}")
+    holder = load_wan_components(configs, tokenizer, device=device, torch_dtype=torch.bfloat16)
+    holder.text_encoder.eval().requires_grad_(False)
+    return holder
+
+
 # Names of the module slots a holder carries (Module → backbone named child;
 # others stay plain attributes). Mirrors WanVideoPipeline's old attribute set.
 _MODULE_SLOTS = (
@@ -247,7 +267,9 @@ def build_holder_from_components(
     return holder
 
 
-def build_holder_from_model_path(model_path: str, device: str = "cpu", *, skip_native_vae: bool = False):
+def build_holder_from_model_path(
+    model_path: str, device: str = "cpu", *, skip_native_vae: bool = False, skip_text_encoder: bool = False
+):
     """Build a component holder from a model dir without full Hydra config.
     ``skip_native_vae`` drops the native VAE weight file before it
     materializes (irreversible external-encoder path).
@@ -260,6 +282,9 @@ def build_holder_from_model_path(model_path: str, device: str = "cpu", *, skip_n
     model_configs, tokenizer_config = discover_model_files(model_path)
     if skip_native_vae:
         model_configs = _filter_native_vae_configs(model_configs)
+    if skip_text_encoder:
+        model_configs = [c for c in model_configs if not is_text_encoder_config(c)]
+        tokenizer_config = None
     return load_wan_components(
         model_configs,
         tokenizer_config,
@@ -300,6 +325,9 @@ def build_holder(source, *, skip_native_vae: bool = False, **kw):
         if model_path is None:
             raise ValueError("dict source must contain 'video_backbone.components' or 'video_backbone.model_path'")
         return build_holder_from_model_path(
-            str(model_path), device=kw.get("device", "cpu"), skip_native_vae=skip_native_vae
+            str(model_path),
+            device=kw.get("device", "cpu"),
+            skip_native_vae=skip_native_vae,
+            skip_text_encoder=bool(vb_cfg.get("skip_text_encoder", False)),
         )
     return source

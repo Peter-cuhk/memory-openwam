@@ -91,6 +91,7 @@ class WanBase(VideoBackbone):
         # division factors / latent_spec before ``cls(holder, ...)``.
         self._scheduler = getattr(holder, "scheduler", None)
         self._tokenizer = getattr(holder, "tokenizer", None)
+        self._text_embedding_cache = getattr(holder, "text_embedding_cache", None)
         self._height_division_factor = getattr(holder, "height_division_factor", None)
         self._width_division_factor = getattr(holder, "width_division_factor", None)
         self._time_division_factor = getattr(holder, "time_division_factor", None)
@@ -770,9 +771,14 @@ class WanBase(VideoBackbone):
         )
 
         batch_size = len(frames)
-        context, seq_lens = wan_encode.encode_text(
-            text, tokenizer=self._tokenizer, text_encoder=self.text_encoder, device=self.device
-        )
+        if self._text_embedding_cache is not None:
+            context, seq_lens = wan_encode.lookup_text_cache(
+                text, self._text_embedding_cache, device=device, dtype=dtype
+            )
+        else:
+            context, seq_lens = wan_encode.encode_text(
+                text, tokenizer=self._tokenizer, text_encoder=self.text_encoder, device=device
+            )
 
         all_input_videos = []
         for clip_frames in frames:

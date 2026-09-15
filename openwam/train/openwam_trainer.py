@@ -27,7 +27,7 @@ import math
 import os
 
 import torch
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 from openwam.train.utils.checkpointing import (
     compute_resume_position,
@@ -86,6 +86,16 @@ class OpenWAMTrainer:
 
         t = cfg.training
         m = cfg.model
+        text_cache = None
+        cache_path = cfg.dataloader.get("text_embedding_cache_path")
+        if cache_path:
+            from openwam.model.video_backbone.wan.encode import load_text_cache
+
+            if not str(m.video_backbone.name).startswith("wan"):
+                raise ValueError("text_embedding_cache_path currently supports Wan only")
+            if not any(name in m.freeze for name in ("video_backbone.text_encoder", "video_backbone")):
+                raise ValueError("T5 embedding cache requires a frozen video_backbone.text_encoder")
+            text_cache = load_text_cache(str(cache_path), str(m.video_backbone.model_path))
 
         # Build architecture (creates video_backbone internally from config).
         from openwam.model import build_architecture, resolve_architecture_config
@@ -130,7 +140,15 @@ class OpenWAMTrainer:
                 propagate_component_specs(ckpt_cfg, cfg)
         else:
             resolved_arch = resolve_architecture_config(m)
+            if text_cache is not None:
+                vb = OmegaConf.to_container(m.video_backbone, resolve=True)
+                resolved_arch.params["video_backbone"] = {**vb, "_source": {**vb, "skip_text_encoder": True}}
             self.architecture = build_architecture(resolved_arch.registry_name, resolved_arch.params)
+        if text_cache is not None:
+            if getattr(self.architecture.video_backbone, "text_encoder", None) is not None:
+                raise ValueError("Cached text training requires a checkpoint saved without T5 weights")
+            self.architecture.video_backbone._text_embedding_cache = text_cache
+            logger.info("Using %d precomputed T5 embeddings; text encoder is not loaded", len(text_cache))
         logger.info(
             "Architecture: %s (framework=%s variant=%s)",
             resolved_arch.registry_name,

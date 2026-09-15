@@ -7,6 +7,7 @@ selects the external-encoder path; otherwise the native Wan VAE is used.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Tuple
 
 import torch
@@ -15,13 +16,40 @@ from torch import Tensor
 from openwam.model.video_backbone.wan.preprocess import preprocess_video as _preprocess_video_native
 from openwam.model.video_backbone.wan.preprocess import vae_output_to_video
 
+TEXT_ENCODING_SETTINGS = {"max_length": 512, "clean": "whitespace", "dtype": "bfloat16"}
+
+
+def text_cache_metadata(model_path: str) -> dict:
+    return {"model_path": str(Path(model_path).resolve()), **TEXT_ENCODING_SETTINGS}
+
+
+def load_text_cache(path: str, model_path: str) -> dict:
+    cache = torch.load(path, map_location="cpu", weights_only=True)
+    if cache["metadata"] != text_cache_metadata(model_path):
+        raise ValueError(f"T5 cache {path} does not match the model path or encoding settings; regenerate it.")
+    for prompt, (context, seq_lens) in cache["embeddings"].items():
+        if context.shape != (1, 512, 4096) or context.dtype != torch.bfloat16 or seq_lens.shape != (1,):
+            raise ValueError(f"Invalid T5 cache entry for {prompt!r}")
+    return cache["embeddings"]
+
+
+def lookup_text_cache(prompts: list, cache: dict, *, device, dtype) -> Tuple[Tensor, Tensor]:
+    try:
+        entries = [cache[prompt] for prompt in prompts]
+    except KeyError as exc:
+        raise KeyError(f"Prompt missing from T5 cache: {exc.args[0]!r}; regenerate the cache.") from exc
+    return (
+        torch.cat([entry[0] for entry in entries]).to(device=device, dtype=dtype),
+        torch.cat([entry[1] for entry in entries]).to(device=device),
+    )
+
 
 def encode_text(prompts: list, *, tokenizer, text_encoder, device) -> Tuple[Tensor, Tensor]:
     ids, mask = tokenizer(
         prompts,
         return_mask=True,
         add_special_tokens=True,
-        max_length=512,
+        max_length=TEXT_ENCODING_SETTINGS["max_length"],
         padding="max_length",
         truncation=True,
     )

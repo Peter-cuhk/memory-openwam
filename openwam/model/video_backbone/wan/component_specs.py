@@ -169,6 +169,11 @@ def save_video_backbone_deploy_assets(output_dir: str, cfg) -> None:
             OmegaConf.update(cfg, "model.video_backbone.components", specs["components"])
         if "tokenizer" in specs and "tokenizer" not in vb_cfg:
             OmegaConf.update(cfg, "model.video_backbone.tokenizer", specs["tokenizer"])
+        if OmegaConf.select(cfg, "dataloader.text_embedding_cache_path"):
+            vb_cfg.components = [c for c in vb_cfg.components if c["attr"] != "text_encoder"]
+            # T5 is absent from the training state dict; load its pretrained
+            # weights separately after strict checkpoint restore at deploy.
+            vb_cfg.precomputed_text_encoder_path = model_path
 
     if "tokenizer" in specs:
         _copy_tokenizer(model_path, output_dir)

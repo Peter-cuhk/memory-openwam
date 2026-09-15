@@ -205,6 +205,14 @@ def load_from_checkpoint_dir(
     # 4. Load all weights from checkpoint
     architecture.load_checkpoint(ckpt_path)
 
+    text_encoder_path = OmegaConf.select(cfg, "model.video_backbone.precomputed_text_encoder_path")
+    if text_encoder_path:
+        from openwam.model.video_backbone.wan.loader import load_text_components
+
+        text_components = load_text_components(str(text_encoder_path))
+        architecture.video_backbone.text_encoder = text_components.text_encoder
+        architecture.video_backbone._tokenizer = text_components.tokenizer
+
     # 5. Move to device and set eval mode — top-down: architecture → video_backbone → submodules.
     _mp = OmegaConf.select(cfg, "training.mixed_precision", default="bf16")
     _DTYPE_MAP = {"bf16": torch.bfloat16, "fp16": torch.float16, "no": torch.float32}
