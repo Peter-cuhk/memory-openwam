@@ -14,14 +14,13 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DEFAULT_LIBERO_PATH="/path/to/LIBERO"
-DEFAULT_LIBERO_PYTHON="/path/to/miniconda3/envs/libero/bin/python"
+source "${SCRIPT_DIR}/env.sh"
 
 MODE="${1:-${LIBERO_SMOKE_MODE:-import}}"
-EXTERNAL_REPO="${LIBERO_PATH:-${DEFAULT_LIBERO_PATH}}"
+EXTERNAL_REPO="${LIBERO_PATH}"
 export LIBERO_PATH="${EXTERNAL_REPO}"
-export LIBERO_CONFIG_PATH="${LIBERO_CONFIG_ROOT:-${HOME}/.libero-openwam}"
-PYTHON_BIN="${LIBERO_PYTHON:-${DEFAULT_LIBERO_PYTHON}}"
+export LIBERO_CONFIG_PATH="${LIBERO_CONFIG_ROOT}"
+PYTHON_BIN="${LIBERO_PYTHON}"
 
 case "${MODE}" in
     import|task|env) ;;

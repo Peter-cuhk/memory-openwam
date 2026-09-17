@@ -10,7 +10,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 WORKFLOW_FILES = {
     "libero": (
-        "environment.yml",
+        "requirements.txt",
+        "env.sh",
         "setup_env.sh",
         "run_smoke.sh",
         "smoke_libero.py",
@@ -81,12 +82,25 @@ def test_workflow_shell_entrypoints_are_executable(relative_path: str) -> None:
 @pytest.mark.parametrize(
     ("relative_path", "expected_name"),
     [
-        ("benchmarks/libero/environment.yml", "libero"),
+        ("benchmarks/libero/requirements.txt", "libero"),
         ("benchmarks/libero-plus/environment.yml", "libero-plus"),
         ("benchmarks/robocasa365/environment.yml", "robocasa365"),
     ],
 )
-def test_client_environment_lock_is_valid_yaml(relative_path: str, expected_name: str) -> None:
-    payload = yaml.safe_load((REPO_ROOT / relative_path).read_text(encoding="utf-8"))
+def test_client_environment_requirements_are_valid(relative_path: str, expected_name: str) -> None:
+    path = REPO_ROOT / relative_path
+    if path.suffix == ".txt":
+        from packaging.requirements import Requirement
+
+        requirements = [
+            Requirement(line) for line in path.read_text().splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        pins = {requirement.name: str(requirement.specifier) for requirement in requirements}
+        assert pins["torch"] == "==2.7.1+cpu"
+        assert pins["numpy"] == "==1.22.4"
+        assert pins["mujoco"] == "==3.3.2"
+        return
+    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
     assert payload["name"] == expected_name
     assert payload["dependencies"]

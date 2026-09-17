@@ -36,9 +36,12 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_CKPT_DIR = Path("/path/to/openwam_checkpoints/new-openwam-libero-sft-10epoch-final")
 DEFAULT_CKPT_NAME = "checkpoint_step_10850.safetensors"
-DEFAULT_LIBERO_PATH = Path("/path/to/LIBERO")
-DEFAULT_LIBERO_PYTHON = Path("/path/to/miniconda3/envs/libero/bin/python")
-DEFAULT_SERVER_PYTHON = Path("/usr/bin/python3.12")
+DEFAULT_LIBERO_PATH = Path(os.environ.get("LIBERO_PATH", REPO_ROOT / "third_party" / "LIBERO"))
+DEFAULT_LIBERO_PYTHON = Path(os.environ.get(
+    "LIBERO_PYTHON",
+    Path(os.environ.get("LIBERO_ENV_PREFIX", "/mnt/cpfs/feiyang/envs/libero")) / "bin" / "python",
+))
+DEFAULT_SERVER_PYTHON = REPO_ROOT / ".venv" / "bin" / "python"
 DEFAULT_POLICY_CONFIG = SCRIPT_DIR / "policy_config.yml"
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "outputs" / "libero"
 REQUIRED_MUJOCO_VERSION = "3.3.2"
@@ -291,8 +294,8 @@ def _client_env(
             "LIBERO_PATH": str(libero_path),
             "LIBERO_CONFIG_ROOT": str(config_root),
             "LIBERO_CONFIG_PATH": str(config_root),
-            "MUJOCO_GL": "egl",
-            "PYOPENGL_PLATFORM": "egl",
+            "MUJOCO_GL": base_env.get("MUJOCO_GL", "egl"),
+            "PYOPENGL_PLATFORM": base_env.get("PYOPENGL_PLATFORM", base_env.get("MUJOCO_GL", "egl")),
             # The client performs no model inference locally. Rendering can be
             # kept off a saturated policy GPU, but CUDA visibility and MuJoCo's
             # physical EGL selection must still name the same device.
@@ -479,6 +482,8 @@ def _resume_signature(
         "seed_override": args.seed,
         "effective_seed": effective_seed,
         "mujoco_version": mujoco_version,
+        "mujoco_gl": os.environ.get("MUJOCO_GL", "egl"),
+        "pyopengl_platform": os.environ.get("PYOPENGL_PLATFORM", os.environ.get("MUJOCO_GL", "egl")),
         "inference_mode": args.inference_mode,
         "inference_horizon": args.inference_horizon,
         "denoise_mode": args.denoise_mode,
@@ -1200,7 +1205,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.num_trials is None:
         args.num_trials = 50
     args.ckpt_dir = args.ckpt_dir.expanduser().resolve()
-    args.server_python = args.server_python.expanduser().resolve()
+    args.server_python = args.server_python.expanduser().absolute()
     # Preserve the public default aliases in logs and manifests instead of
     # exposing an implementation-specific physical environment directory.
     args.libero_python = args.libero_python.expanduser().absolute()

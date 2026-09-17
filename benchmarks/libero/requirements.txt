@@ -1,0 +1,26 @@
+# Python 3.10; installed only into LIBERO_ENV_PREFIX with uv.
+# Preserve the pinned LIBERO upstream dependencies and CPU-only client torch.
+hydra-core==1.2.0
+numpy==1.22.4
+wandb==0.13.1
+easydict==1.9
+transformers==4.21.1
+opencv-python==4.6.0.66
+robomimic==0.2.0
+einops==0.4.1
+thop==0.1.1.post2209072238
+robosuite==1.4.0
+bddl==1.0.1
+future==0.18.2
+matplotlib==3.5.3
+cloudpickle==2.1.0
+gym==0.25.2
+torch==2.7.1+cpu
+mujoco==3.3.2
+imageio==2.37.4
+imageio-ffmpeg==0.6.0
+PyYAML==6.0.3
+websockets==13.1
+# Older simulator packages still import pkg_resources.
+setuptools<81
+packaging

@@ -7,8 +7,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LIBERO_PATH="${LIBERO_PATH:-/path/to/LIBERO}"
-LIBERO_PYTHON="${LIBERO_PYTHON:-/path/to/miniconda3/envs/libero/bin/python}"
+source "${SCRIPT_DIR}/env.sh"
 SUITE="${1:-libero_spatial}"
 TASK_ID="${2:-0}"
 PORT="${3:-${LIBERO_PORT:-8848}}"

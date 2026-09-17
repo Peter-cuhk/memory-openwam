@@ -15,6 +15,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+source "${SCRIPT_DIR}/env.sh"
 
 if [[ $# -ge 2 ]]; then
     CKPT_DIR="$1"
@@ -29,11 +30,11 @@ fi
     exit 2
 }
 
-CLIENT_PYTHON="${LIBERO_PYTHON:-/path/to/miniconda3/envs/libero/bin/python}"
-CLIENT_REPO="${LIBERO_PATH:-/path/to/LIBERO}"
+CLIENT_PYTHON="${LIBERO_PYTHON}"
+CLIENT_REPO="${LIBERO_PATH}"
 POLICY_CONFIG="${POLICY_CONFIG_PATH:-${SCRIPT_DIR}/policy_config.yml}"
 
-SERVER_PYTHON="${SERVER_PYTHON:-python}"
+SERVER_PYTHON="${SERVER_PYTHON:-${REPO_ROOT}/.venv/bin/python}"
 if [[ "${SERVER_PYTHON}" != */* ]]; then
     SERVER_PYTHON="$(command -v "${SERVER_PYTHON}")" || {
         echo "[ERROR] SERVER_PYTHON command not found" >&2

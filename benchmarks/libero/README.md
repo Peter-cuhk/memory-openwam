@@ -2,33 +2,33 @@
 
 Two processes: the **OpenWAM policy server** (this repo's env, holds the model) and the **LIBERO client** (its own env). They talk over WebSocket ([wire protocol](../README.md)), so the two environments never interfere. For the LIBERO-plus perturbation suite see [`benchmarks/libero-plus/`](../libero-plus/README.md).
 
-Commands below assume conda at `/path/to/miniconda3` and the LIBERO checkout at `/path/to/LIBERO` — substitute your actual paths.
+Run commands from the repository root. The model server uses the root `.venv`; the uv-managed simulator client uses `/mnt/cpfs/feiyang/envs/libero`.
 
 ## 1. Environment Setup
 
-One command builds everything (clones LIBERO at the pinned commit, applies the PyTorch≥2.6 patch, creates the conda env, verifies every version):
+The setup script reuses an installed Python 3.10, clones LIBERO at the pinned commit into `third_party/LIBERO`, applies the PyTorch≥2.6 patch, and creates the client environment with `uv venv` / `uv pip install`:
 
 ```bash
-CONDA_BIN=/path/to/miniconda3/bin/conda \
-LIBERO_ENV_PREFIX=/path/to/miniconda3/envs/libero \
-LIBERO_PATH=/path/to/LIBERO \
 bash benchmarks/libero/setup_env.sh
 ```
 
-Verify (no model needed):
+Python downloads are disabled in setup. Python 3.10.20 is installed with uv under `/mnt/cpfs/feiyang/envs/libero/python`; set `LIBERO_BASE_PYTHON` to reuse another Python 3.10 executable. NumPy 1.22.4 is incompatible with the training environment's Python 3.12. Cache directories are under `/mnt/cpfs/feiyang/cache`; setup never installs a CUDA toolkit or system graphics libraries.
+
+Override `LIBERO_ENV_PREFIX` and `LIBERO_PATH` for another environment or checkout location on the mounted disk. Verify without a model:
 
 ```bash
-LIBERO_PATH=/path/to/LIBERO LIBERO_PYTHON=/path/to/miniconda3/envs/libero/bin/python \
 bash benchmarks/libero/run_smoke.sh env    # also: import | task
+# If the host has OSMesa but no working EGL runtime:
+MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa bash benchmarks/libero/run_smoke.sh env
 ```
 
 <details>
 <summary><b>What the script pins (details)</b></summary>
 
 - LIBERO commit `8f1084e3132a39270c3a13ebe37270a43ece2a01`; setup aborts on any mismatch.
-- Python 3.10, `mujoco==3.3.2` (re-checked at every launch), full upstream pip pins.
+- Python 3.10, CPU-only `torch==2.7.1+cpu`, `mujoco==3.3.2` (re-checked at every launch), upstream pins in `requirements.txt`.
 - `patches/libero-pytorch-load.patch` applied automatically (`torch.load(..., weights_only=False)`).
-- No separate asset download — assets ship inside the clone. Clients auto-generate `~/.libero-openwam/config.yaml` (relocate with `LIBERO_CONFIG_ROOT`).
+- No separate asset download — assets ship inside the clone. Shell launchers keep the runtime config under `outputs/libero/runtime` (relocate with `LIBERO_CONFIG_ROOT`).
 - EGL rendering env vars are exported by the launch scripts; no manual setup.
 
 </details>
@@ -43,7 +43,7 @@ python scripts/download_assets/download_openwam_checkpoints.py
 Run from the repo root — the checkpoint lands in `assets/openwam_ckpt/openwam_alpha/OpenWAM-Alpha-Sim-LIBERO` (or use a checkpoint you trained yourself). Needed only for `single_eval.sh`; the managed `run_eval.sh` below starts its own servers:
 
 ```bash
-bash scripts/deploy.sh assets/openwam_ckpt/openwam_alpha/OpenWAM-Alpha-Sim-LIBERO
+.venv/bin/python scripts/deploy.py --ckpt-dir assets/openwam_ckpt/openwam_alpha/OpenWAM-Alpha-Sim-LIBERO
 ```
 
 WebSocket port 8848 by default (`--port` to change). Keep it running.
@@ -53,9 +53,6 @@ WebSocket port 8848 by default (`--port` to change). Keep it running.
 Full run (primary command) — the managed launcher starts its own servers, spreads all four suites over the GPUs, and tears everything down:
 
 ```bash
-SERVER_PYTHON=/path/to/miniconda3/envs/openwam/bin/python \
-LIBERO_PYTHON=/path/to/miniconda3/envs/libero/bin/python \
-LIBERO_PATH=/path/to/LIBERO \
 GPUS=0,1 REPLICAS_PER_GPU=1 \
 bash benchmarks/libero/run_eval.sh \
   assets/openwam_ckpt/openwam_alpha/OpenWAM-Alpha-Sim-LIBERO checkpoint_step_10690.safetensors \
@@ -65,7 +62,6 @@ bash benchmarks/libero/run_eval.sh \
 Append `--smoke` first for a one-task end-to-end validation. The two trailing flags are the defensive settings described under *Notes & troubleshooting* — drop them once you have confirmed your driver and PyTorch build do not need them. Single suite against the running server from section 2 (args: suite, task id, port, host):
 
 ```bash
-LIBERO_PATH=/path/to/LIBERO LIBERO_PYTHON=/path/to/miniconda3/envs/libero/bin/python \
 bash benchmarks/libero/single_eval.sh libero_spatial 0 8848 127.0.0.1
 ```
 
