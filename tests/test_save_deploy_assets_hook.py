@@ -78,6 +78,32 @@ def test_wan_cached_text_assets_exclude_t5(tmp_path, monkeypatch):
     assert cfg.model.video_backbone.precomputed_text_encoder_path == str(tmp_path)
 
 
+def test_wan_tokenizer_copy_can_be_disabled(tmp_path, monkeypatch):
+    from omegaconf import OmegaConf
+
+    from openwam.model.video_backbone.wan import component_specs
+
+    monkeypatch.setattr(
+        component_specs,
+        "generate_video_backbone_component_specs",
+        lambda _: {"components": [], "tokenizer": {"subdir": "tokenizer/google/umt5-xxl"}},
+    )
+    copied = []
+    monkeypatch.setattr(component_specs, "_copy_tokenizer", lambda *args: copied.append(args))
+    cfg = OmegaConf.create(
+        {
+            "model": {"video_backbone": {"model_path": str(tmp_path)}},
+            "training": {"save_tokenizer": False},
+            "dataloader": {},
+        }
+    )
+
+    component_specs.save_video_backbone_deploy_assets(str(tmp_path), cfg)
+
+    assert cfg.model.video_backbone.tokenizer.subdir == "tokenizer/google/umt5-xxl"
+    assert copied == []
+
+
 def test_cached_text_checkpoint_restores_before_external_t5(tmp_path, monkeypatch):
     from types import SimpleNamespace
 

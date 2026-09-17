@@ -24,35 +24,30 @@ model:
     use_proprioception: true
 
 training:
-  # 起步配置，显存占用仍需在实际 PPU 节点验证。
+  # 已通过双卡 PPU smoke；扩展到多节点时需验证通信与显存开销。
   debug: false
-  batch_size: 1                    # 每卡每个 micro-step 的样本数
-  gradient_accumulation_steps: 4   # 有效 batch = 卡数 × batch_size × 累积步数
+  batch_size: 8                   # 每卡每个 micro-step 的样本数
+  gradient_accumulation_steps: 1   # 有效 batch = 卡数 × batch_size × 累积步数
   dataset_num_workers: 4
   learning_rate: 1e-4
   num_epochs: 5
   max_steps: null                  # 如设置，单位为 micro-step，非 optimizer step
   mixed_precision: bf16
-  zero_stage: 2
+  zero_stage: 1
   use_gradient_checkpointing: true
   offload_optimizer_device: none
   # 两者为 null：加载 Wan 骨干，初始化新的动作模型。
   # 微调 OpenWAM checkpoint 填 finetune；恢复完整训练状态填 resume，二选一。
   finetune_ckpt_path: null
   resume_ckpt_path: null
-  output_path: /mnt/cpfs/feiyang/code/OpenWAM/outputs/libero/checkpoints
-  save_steps: 1000
-  keep_last_k_ckpts: 2
+  save_steps: 2000
+  keep_last_k_ckpts: 10
   save_full_states_for_resume: false  # 需要中断后精确恢复时改为 true，额外保存优化器状态
 
 project:
   name: libero
   seed: 42
-  output_dir: /mnt/cpfs/feiyang/code/OpenWAM/outputs/libero/logs/${now:%Y-%m-%d_%H-%M-%S}
+  output_dir: /mnt/cpfs/feiyang/code/OpenWAM/outputs/libero
   wandb:
-    project: libero
-    run_name: libero
-
-hydra:
-  run:
-    dir: ${project.output_dir}
+    project: OpenWAM
+    run_name: libero                  # W&B name: libero+<same timestamp as local run directory>

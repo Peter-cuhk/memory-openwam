@@ -47,4 +47,4 @@ color_jitter:
   hue: 0.0
 
 # Run scripts/precompute_t5_embeddings.py first; null uses online T5 encoding.
-text_embedding_cache_path: /mnt/cpfs/feiyang/cache/openwam/libero/t5_embeddings.pt
+text_embedding_cache_path: null

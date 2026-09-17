@@ -190,7 +190,7 @@ With a pretrained video backbone, a fresh run loads the selected components and 
 # Model and dataloader
 bash scripts/train.sh model=dual_system dataloader=robotwin \
   dataloader.dataset_dir=<dataset_dir_path> \
-  training.output_path=<output_dir_path> \
+  project.output_dir=<output_dir_path> \
   training.batch_size=1 \
   training.max_steps=20
 ~~~

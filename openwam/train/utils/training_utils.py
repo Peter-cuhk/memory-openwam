@@ -85,7 +85,7 @@ def build_cosine_scheduler(optimizer, *, total_opt_steps: int, cfg, num_processe
     return scheduler
 
 
-def init_wandb(cfg):
+def init_wandb(cfg, output_path: str):
     """Init a wandb run from cfg.project.wandb. Returns the run or None."""
     wandb_cfg = cfg.project.get("wandb", None)
     if wandb_cfg is None:
@@ -100,6 +100,12 @@ def init_wandb(cfg):
         return None
 
     run_name = getattr(wandb_cfg, "run_name", None)
+    if run_name:
+        # output_path is <run_root>/<Hydra timestamp>/training. Deriving the
+        # suffix from that path keeps the local run and W&B names identical,
+        # including when a run resumes in its existing directory.
+        run_timestamp = os.path.basename(os.path.dirname(os.path.normpath(output_path)))
+        run_name = f"{run_name}+{run_timestamp}"
     entity = getattr(wandb_cfg, "entity", None)
     from omegaconf import OmegaConf
 

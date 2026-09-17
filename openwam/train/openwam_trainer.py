@@ -252,8 +252,16 @@ class OpenWAMTrainer:
         # Finetune warm-start weights were already loaded at architecture
         # construction (__init__, self-contained ckpt-dir path). Step stays 0.
 
-        output_path, resume_state_dir = self.setup_output_dir(debug, resume_path)
+        output_path, resume_state_dir = self.setup_output_dir(resume_path)
         optimizer, dataloader, scheduler = self.prepare_accelerate(optimizer, dataloader, scheduler)
+
+        data_visualizer = None
+        if self._vis_data_enabled:
+            from openwam.train.utils.data_visualization import InteractiveDataVisualizer
+
+            data_visualizer = InteractiveDataVisualizer(output_path, self.accelerator)
+            if self.accelerator.is_main_process:
+                logger.info("VIS_DATA interactive inspection enabled: %s", data_visualizer.output_dir)
 
         if self._run_seed is not None:
             from openwam.dataloader.mixture import MixtureDataset
@@ -269,7 +277,7 @@ class OpenWAMTrainer:
         all_params = [p for group in optimizer.param_groups for p in group["params"]]
 
         is_main = self.accelerator is None or self.accelerator.is_main_process
-        wandb_run = None if (debug or not is_main) else init_wandb(self.cfg)
+        wandb_run = None if (debug or not is_main) else init_wandb(self.cfg, output_path)
 
         from tqdm import tqdm
 
@@ -331,6 +339,8 @@ class OpenWAMTrainer:
             else:
                 epoch_iter = dataloader
             for batch in epoch_iter:
+                if data_visualizer is not None:
+                    data_visualizer.inspect(batch, global_step=global_step + 1, epoch=epoch)
                 if self._run_seed is not None:
                     step_seed = per_step_seed(self._run_seed, rank=self._rank, step=global_step)
                     torch.manual_seed(step_seed)
@@ -419,10 +429,14 @@ class OpenWAMTrainer:
         runs while keeping per-epoch / per-worker variation.
         """
         from openwam.dataloader.mixture import MixtureDataset
+        from openwam.train.utils.data_visualization import VisualizationDataset, vis_data_enabled
 
         t = self.cfg.training
+        self._vis_data_enabled = vis_data_enabled()
         shuffle = not isinstance(self.dataset, MixtureDataset)
+        loader_dataset = VisualizationDataset(self.dataset) if self._vis_data_enabled else self.dataset
         kwargs: dict = dict(
+            dataset=loader_dataset,
             batch_size=batch_size,
             shuffle=shuffle,
             num_workers=int(t.dataset_num_workers),
@@ -439,7 +453,7 @@ class OpenWAMTrainer:
 
             kwargs["generator"] = make_dataloader_generator(self._run_seed, rank=self._rank)
             kwargs["worker_init_fn"] = dataloader_worker_init_fn
-        return torch.utils.data.DataLoader(self.dataset, **kwargs)
+        return torch.utils.data.DataLoader(**kwargs)
 
     # (5) Called by train() — linear-warmup + cosine schedule, or None (constant LR / debug).
     def build_lr_scheduler(self, optimizer, total_opt_steps: int, debug: bool = False):
@@ -454,16 +468,16 @@ class OpenWAMTrainer:
         return None
 
     # (6) Called by train() — locate/create the run dir and resolve the resume state dir.
-    def setup_output_dir(self, debug: bool, resume_path: str | None) -> tuple[str, str | None]:
+    def setup_output_dir(self, resume_path: str | None) -> tuple[str, str | None]:
         """Locate/create the run dir and resolve the resume state dir.
 
         With a usable resume state the run dir is REUSED (assets/config/norm already
-        present); otherwise rank-0 creates a fresh timestamped dir and broadcasts it.
+        present); otherwise rank-0 uses the ``training`` directory beside Hydra's
+        timestamped ``logs`` directory and broadcasts it.
         All ranks resolve ``resume_state_dir`` independently (shared FS, deterministic),
         so a missing-state error raises on every rank without deadlocking the broadcast.
         Returns ``(output_path, resume_state_dir)``.
         """
-        base_output_path = getattr(self.cfg.training, "output_path", "./models")
         is_main = self.accelerator.is_main_process
 
         resume_state_dir = find_latest_accel_state(resume_path) if resume_path else None
@@ -483,17 +497,15 @@ class OpenWAMTrainer:
             return output_path, resume_state_dir
 
         if is_main:
-            from datetime import datetime
+            from hydra.core.hydra_config import HydraConfig
 
-            run_dir_name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            if debug:
-                run_dir_name += "_debug"
-            output_path = os.path.join(base_output_path, run_dir_name)
+            log_dir = HydraConfig.get().runtime.output_dir
+            output_path = os.path.join(os.path.dirname(log_dir), "training")
             os.makedirs(output_path, exist_ok=True)
             # Self-contained deploy: backbones save assets, then config + action stats.
             # BEFORE save_config so config.yaml carries the merged reconstruction specs.
             self.architecture.save_assets_for_deployment(output_path, self.cfg)
-            if self._ckpt_source_dir is not None:
+            if self._ckpt_source_dir is not None and bool(cfg_get(self.cfg.training, "save_tokenizer", True)):
                 # Self-contained finetune/resume: model_path may be unreachable,
                 # so relay the tokenizer files from the source ckpt dir instead.
                 from openwam.train.utils.ckpt_model_loader import copy_ckpt_artifacts

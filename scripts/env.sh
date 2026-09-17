@@ -21,7 +21,14 @@ export PRE_COMMIT_HOME="${OPENWAM_CACHE_ROOT}/pre-commit"
 export WANDB_CACHE_DIR="${OPENWAM_CACHE_ROOT}/wandb"
 export WANDB_CONFIG_DIR="${WANDB_CACHE_DIR}/config"
 export WANDB_DIR="${OPENWAM_ROOT}/outputs"
-export WANDB_MODE="${WANDB_MODE:-offline}"
+export WANDB_MODE="online"
+export WANDB_BASE_URL="https://api.wandb.ai"
+if [[ -f "${OPENWAM_ROOT}/.env" ]]; then
+    source "${OPENWAM_ROOT}/.env"
+    if [[ -n "${WANDB_API_KEY:-}" ]]; then
+        export WANDB_API_KEY
+    fi
+fi
 export UV_LINK_MODE=copy
 export UV_PYTHON_DOWNLOADS=never
 export PYTHONNOUSERSITE=1

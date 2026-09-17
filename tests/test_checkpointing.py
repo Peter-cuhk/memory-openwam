@@ -310,12 +310,44 @@ def test_setup_output_dir_verifies_stats_before_reusing_resume_run(tmp_path, mon
         lambda output_dir, dataset: calls.append((output_dir, dataset)),
     )
     trainer = object.__new__(trainer_module.OpenWAMTrainer)
-    trainer.cfg = OmegaConf.create({"training": {"output_path": str(tmp_path / "unused")}})
+    trainer.cfg = OmegaConf.create({"training": {}, "project": {"output_dir": str(tmp_path / "unused")}})
     trainer.accelerator = SimpleNamespace(is_main_process=True)
     trainer.dataset = object()
 
-    output_path, resume_state_dir = trainer.setup_output_dir(debug=False, resume_path=str(run_dir))
+    output_path, resume_state_dir = trainer.setup_output_dir(resume_path=str(run_dir))
 
     assert output_path == str(run_dir)
     assert resume_state_dir == str(state_dir)
     assert calls == [(str(run_dir), trainer.dataset)]
+
+
+def test_setup_output_dir_uses_training_sibling_of_hydra_logs(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    import torch.distributed as dist
+    from hydra.core.hydra_config import HydraConfig
+    from omegaconf import OmegaConf
+
+    import openwam.train.openwam_trainer as trainer_module
+
+    run_dir = tmp_path / "2026-09-16_12-34-56"
+    log_dir = run_dir / "logs"
+    monkeypatch.setattr(
+        HydraConfig,
+        "get",
+        classmethod(lambda cls: SimpleNamespace(runtime=SimpleNamespace(output_dir=str(log_dir)))),
+    )
+    monkeypatch.setattr(dist, "broadcast_object_list", lambda values, src: None)
+
+    trainer = object.__new__(trainer_module.OpenWAMTrainer)
+    trainer.cfg = OmegaConf.create({"training": {}, "project": {"output_dir": str(tmp_path)}})
+    trainer.accelerator = SimpleNamespace(is_main_process=True)
+    trainer.architecture = SimpleNamespace(save_assets_for_deployment=lambda output_dir, cfg: None)
+    trainer.dataset = None
+    trainer._ckpt_source_dir = None
+
+    output_path, resume_state_dir = trainer.setup_output_dir(resume_path=None)
+
+    assert output_path == str(run_dir / "training")
+    assert resume_state_dir is None
+    assert (run_dir / "training" / "config.yaml").is_file()

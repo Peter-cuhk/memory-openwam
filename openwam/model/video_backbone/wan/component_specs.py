@@ -175,5 +175,5 @@ def save_video_backbone_deploy_assets(output_dir: str, cfg) -> None:
             # weights separately after strict checkpoint restore at deploy.
             vb_cfg.precomputed_text_encoder_path = model_path
 
-    if "tokenizer" in specs:
+    if "tokenizer" in specs and bool(OmegaConf.select(cfg, "training.save_tokenizer", default=True)):
         _copy_tokenizer(model_path, output_dir)
