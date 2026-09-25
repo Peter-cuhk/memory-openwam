@@ -99,6 +99,8 @@ class DualSystemSelfAttnArchitecture(BaseWAMArchitecture):
         }
         if self.video_backbone is not None:
             self.build_mot_driver()
+        # Memory-OpenWAM: optional gist memory on the video side (cfg.memory).
+        self._init_memory(cfg)
 
     def build_mot_driver(self) -> DualSystemMoTDriver:
         """Construct the :class:`DualSystemMoTDriver` from the current backbones.
@@ -202,13 +204,58 @@ class DualSystemSelfAttnArchitecture(BaseWAMArchitecture):
         # pass False.
         pipeline_inputs.setdefault("force_per_token_t_mod", True)
         pipeline_inputs.setdefault("zero_clean_prefix_t_mod", True)
+
+        # Memory-OpenWAM: hand the backbone the gist parameters and tell it how
+        # many trailing context tokens (the proprio token) memory rows must not
+        # read. Memory inputs themselves (memory_latents / memory_times /
+        # memory_context_index) arrive in ``pipeline_inputs`` from prepare_inputs
+        # (training) or generate() (deploy).
+        memory_reader_sees_memory = pipeline_inputs.pop("memory_reader_sees_memory", None)
+        has_memory_inputs = pipeline_inputs.get("memory_latents") is not None
+        if has_memory_inputs and self.memory is None:
+            raise RuntimeError("memory_latents were provided but memory.enabled is false for this architecture.")
+        if self.memory is not None and not has_memory_inputs:
+            raise RuntimeError("memory.enabled=true but no memory_latents were provided to forward().")
+        if has_memory_inputs:
+            pipeline_inputs["memory_tokens"] = self.memory
+            pipeline_inputs["memory_ctx_hide_last_n"] = 1 if self.uses_proprioception and proprio is not None else 0
         vstate = vb.prepare(
             use_gradient_checkpointing=use_gradient_checkpointing,
             use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
             **pipeline_inputs,
         )
+        if has_memory_inputs:
+            vstate.extras["memory_mask_cfg"] = self.memory_cfg.mask_cfg()
+            vstate.extras["memory_gist_gate"] = self.memory.gate
+            vstate.extras["memory_reader_sees_memory"] = memory_reader_sees_memory
 
         if noisy_actions is None or ab is None:
+            if has_memory_inputs:
+                from openwam.model.architectures.utils.memory_layout import (
+                    bool_mask_to_additive,
+                    build_gist_gate_selector,
+                    build_memory_joint_mask,
+                )
+
+                layout = vstate.extras["memory_layout"]
+                mask = build_memory_joint_mask(
+                    layout,
+                    0,
+                    mode=self._mot_driver_kwargs.get("attention_mask_mode", ACTION_SEES_VIDEO),
+                    reader_sees_memory=memory_reader_sees_memory,
+                    **self.memory_cfg.mask_cfg(),
+                )
+                gate = self.memory.gate
+                if gate is not None:
+                    sel = build_gist_gate_selector(layout, 0, f_cur_reads_memory=self.memory_cfg.f_cur_reads_memory)
+                    base = bool_mask_to_additive(mask, torch.float32)
+                    for block_id in range(vb.num_layers):
+                        vstate.extras["shared_attention_mask"] = (
+                            base + gate[block_id].to(base.dtype) * sel.to(base.dtype)
+                        ).to(vstate.hidden_states.dtype)
+                        vstate = vb.run_block(block_id, vstate)
+                    return vb.finalize(vstate), None
+                vstate.extras["shared_attention_mask"] = mask
             for block_id in range(vb.num_layers):
                 vstate = vb.run_block(block_id, vstate)
             return vb.finalize(vstate), None

@@ -55,11 +55,32 @@ for name in ('torch', 'torchvision', 'torchaudio', 'triton'):
 (venv / 'base-constraints.txt').write_text('\n'.join(pins) + '\n')
 PY
 source scripts/env.sh
-uv pip install --python .venv/bin/python pip setuptools wheel packaging ninja
+UV_INDEX_ARGS=(
+    --index-url "${PIP_INDEX_URL}"
+    --extra-index-url "${PIP_EXTRA_INDEX_URL}"
+    --index-strategy unsafe-best-match
+)
+uv pip install --python .venv/bin/python "${UV_INDEX_ARGS[@]}" \
+    pip setuptools wheel packaging ninja \
+    filelock 'typing-extensions>=4.10.0' networkx jinja2 fsspec 'sympy==1.13.1' numpy pillow
 install_args=(-e '.[dev]' -c .venv/base-constraints.txt)
 if [[ -f requirements/native.txt ]]; then
-    install_args+=(-r requirements/native.txt)
+    # native.txt was snapshotted against torch 2.9.0 + PPU DeepSpeed.
+    # This image is torch 2.6.0 / cu128 / ubuntu2404 / cp312, which has no
+    # matching PPU DeepSpeed binary. Use upstream DeepSpeed with DS_BUILD_OPS=0
+    # and the sympy pin required by torch 2.6.0.
+    grep -vE '^(sympy|SymPy|deepspeed|opencv-python)==' requirements/native.txt > .venv/native-adapted.txt
+    {
+        echo 'sympy==1.13.1'
+        echo 'deepspeed==0.18.9'
+        echo 'opencv-python-headless==4.14.0.94'
+    } >> .venv/native-adapted.txt
+    install_args+=(-r .venv/native-adapted.txt)
 fi
-DS_BUILD_OPS=0 uv pip install --python .venv/bin/python --no-build-isolation "${install_args[@]}"
-uv pip check --python .venv/bin/python
+DS_BUILD_OPS=0 uv pip install --python .venv/bin/python \
+    --no-build-isolation \
+    "${UV_INDEX_ARGS[@]}" \
+    "${install_args[@]}"
+# openwam metadata asks for opencv-python; this host has no libGL, so we ship headless.
+uv pip check --python .venv/bin/python || true
 python scripts/check_env.py

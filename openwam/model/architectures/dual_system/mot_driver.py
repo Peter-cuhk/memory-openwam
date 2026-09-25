@@ -28,6 +28,11 @@ from openwam.model.architectures.utils.mask_modes import (
     validate_attention_mask_mode,
     widen_mask_for_prefix_kv,
 )
+from openwam.model.architectures.utils.memory_layout import (
+    bool_mask_to_additive,
+    build_gist_gate_selector,
+    build_memory_joint_mask,
+)
 
 if TYPE_CHECKING:
     from openwam.model.action_backbone.base import ActionDiTBackbone
@@ -139,6 +144,9 @@ class DualSystemMoTDriver:
         q = rearrange(q_cat, "b s (n d) -> b n s d", n=n)
         k = rearrange(k_cat, "b s (n d) -> b n s d", n=n)
         v = rearrange(v_cat, "b s (n d) -> b n s d", n=n)
+        if attn_mask is not None and attn_mask.dtype != torch.bool:
+            # Additive (gist-gated) mask must match the query dtype for SDPA.
+            attn_mask = attn_mask.to(dtype=q.dtype)
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         return rearrange(out, "b n s d -> b s (n d)", n=n)
 
@@ -327,7 +335,6 @@ class DualSystemMoTDriver:
         # (CosmosPredict25) ``shape[1]`` is just ``T`` — wrong. Going through f and
         # the shared ``compute_video_tokens_per_frame`` helper is the only
         # formulation that works for both layouts.
-        s_video = int(vstate.grid_frames) * self._video_tokens_per_frame(vstate)
         payload = astate.payload
         if payload is None or not hasattr(payload, "x_action"):
             raise RuntimeError(
@@ -335,12 +342,35 @@ class DualSystemMoTDriver:
             )
         s_action = payload.x_action.shape[1]
 
-        attn_mask = self._build_attention_mask(
-            s_video=s_video,
-            s_action=s_action,
-            video_tokens_per_frame=self._video_tokens_per_frame(vstate),
-            device=vstate.hidden_states.device,
-        )
+        memory_layout = vstate.extras.get("memory_layout")
+        gate_selector = None
+        gist_gate = None
+        if memory_layout is not None:
+            # Memory-OpenWAM: role-aware joint mask over
+            # [memory prefix | window | action]; per sample (B, 1, S, S).
+            mem_cfg = dict(vstate.extras.get("memory_mask_cfg") or {})
+            attn_mask = build_memory_joint_mask(
+                memory_layout,
+                s_action,
+                mode=self.attention_mask_mode,
+                f_cur_reads_memory=bool(mem_cfg.get("f_cur_reads_memory", False)),
+                recent_kv=bool(mem_cfg.get("recent_kv", False)),
+                reader_sees_memory=vstate.extras.get("memory_reader_sees_memory"),
+            )
+            gist_gate = vstate.extras.get("memory_gist_gate")
+            if gist_gate is not None:
+                gate_selector = build_gist_gate_selector(
+                    memory_layout, s_action, f_cur_reads_memory=bool(mem_cfg.get("f_cur_reads_memory", False))
+                )
+                attn_mask = bool_mask_to_additive(attn_mask, torch.float32)
+        else:
+            s_video = int(vstate.grid_frames) * self._video_tokens_per_frame(vstate)
+            attn_mask = self._build_attention_mask(
+                s_video=s_video,
+                s_action=s_action,
+                video_tokens_per_frame=self._video_tokens_per_frame(vstate),
+                device=vstate.hidden_states.device,
+            )
 
         # Backbones may prepend prefix K/V tokens (keys without matching query
         # rows — e.g. Cosmos3's cached und text stream). ``_step_impl`` needs no
@@ -349,11 +379,16 @@ class DualSystemMoTDriver:
         attn_mask = widen_mask_for_prefix_kv(attn_mask, vstate)
 
         for layer_id in range(self.num_layers):
+            layer_mask = attn_mask
+            if gate_selector is not None:
+                # Per-layer learnable bias on reader->gist logits (init strongly
+                # negative so the pretrained function is preserved at step 0).
+                layer_mask = attn_mask + gist_gate[layer_id].to(attn_mask.dtype) * gate_selector.to(attn_mask.dtype)
             vstate, astate = self.step(
                 layer_id,
                 vstate,
                 astate,
-                attn_mask=attn_mask,
+                attn_mask=layer_mask,
                 use_gradient_checkpointing=use_gradient_checkpointing,
                 use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
             )

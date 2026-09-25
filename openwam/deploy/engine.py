@@ -332,8 +332,26 @@ class JointInferenceEngine(BaseInferenceEngine):
             )
         )
 
+        # Memory-OpenWAM: encode the episode history (real observations only)
+        # into padded memory latents; forwarded through generate(**extra).
+        memory_kwargs = {}
+        if conditions.get("memory_video") is not None or conditions.get("memory_latents") is not None:
+            if not getattr(self.architecture, "memory_enabled", False):
+                raise RuntimeError("memory inputs were provided but the loaded architecture has no memory.")
+            sample = {
+                "memory_video": conditions.get("memory_video"),
+                "memory_latents": conditions.get("memory_latents"),
+                "memory_times": conditions["memory_times"],
+                "memory_context_index": conditions["memory_context_index"],
+                "memory_actions": conditions.get("memory_actions"),
+            }
+            memory_kwargs = self.architecture.prepare_memory_inputs([sample])
+        elif getattr(self.architecture, "memory_enabled", False):
+            raise RuntimeError("Memory-OpenWAM architecture needs memory_video/memory_times in conditions.")
+
         generate_kwargs = self._filter_architecture_generate_kwargs(
             {
+                **memory_kwargs,
                 "schedule": schedule,
                 "prompt": conditions.get("prompt", ""),
                 "vace_video": conditions.get("vace_video", None),

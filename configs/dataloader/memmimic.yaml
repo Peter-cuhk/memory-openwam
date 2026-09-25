@@ -1,0 +1,51 @@
+type: memmimic
+
+# GMP (Gated Memory Policy) push_cube zarr export: dataset_dir/episode_data.zarr
+dataset_dir: /mnt/cpfs/shared/datasets/memmimic/v1/push_cube
+
+# 10-D pose = tcp xyz + rot6d(from wxyz quat) + gripper width, for action and state.
+# Mapped 1:1 onto OpenWAM-α left-arm slots 0:10.
+unify_action: true
+unify_action_map: ["0-9"]
+unify_state_map: ["0-9"]
+normalize_mode: min-max
+# Deploy: model_loader picks stats[action_mode] / stats[f"{action_mode}_state"]
+# from normalization_stats.npy (the reader writes both under this key).
+action_mode: memmimic_pose10
+# Auto-built over the train split on first use (rot6d pinned to identity,
+# constant dims widened): <dataset_dir>/openwam_normalization_stats.npy
+normalization_stats_path: null
+
+# α temporal contract at 10 Hz: 33 source steps -> 9 video frames, 32 actions.
+num_frames: 33
+video_stride: 4
+# Windows start on latent boundaries (16 source steps) so that the clean
+# frame is the last frame of history chunk c: one sample per (episode, c).
+window_stride: 16
+
+# Single third-person view; source frames are 256x256 and are resized.
+height: 256
+width: 320
+
+prompt: "push the blue cube so that it stops inside the target box"
+
+# Episode memory (Memory-OpenWAM). memory_max_latents=40 covers the whole
+# push_cube episode (~36 latents), i.e. no truncation.
+memory_enabled: true
+memory_max_latents: 40
+# Optional per-episode VAE latent cache written by scripts/precompute_memmimic_latents.py
+memory_latent_cache_dir: null
+# Per-slot history of executed commands (pairs with model.architecture.memory.action_history).
+memory_action_history: false
+# Action-loss weight of GMP's critical steps (push acceleration, ~12% of steps); 1.0 = uniform.
+critical_step_weight: 1.0
+# absolute: 10-D poses. delta: xyz as per-step increments (first one relative to the proprio), rot6d /
+# gripper absolute -- set action_mode: memmimic_delta10 with it (stats: openwam_normalization_stats_delta.npy).
+action_repr: absolute
+
+# GMP trains on 64 trajectories; null = all 500.
+traj_num: null
+val_episodes: 0
+# >0 keeps only windows starting at/after this source step (longest memory); batch-size probe only.
+min_window_offset: 0
+split: train

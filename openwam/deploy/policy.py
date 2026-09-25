@@ -38,6 +38,21 @@ class WAMPolicy:
 
         self._execution_config = normalize_execution_config(execution_config)
         self._async = self._execution_config.enabled
+
+        # Memory-OpenWAM: keep every real observation of the episode so the
+        # engine can rebuild the memory prefix at each replan.
+        self._memory_buffer = None
+        arch = getattr(engine, "architecture", None)
+        if arch is not None and getattr(arch, "memory_enabled", False):
+            from openwam.deploy.memory_buffer import EpisodeMemoryBuffer
+
+            dl_cfg = getattr(cfg, "dataloader", None)
+            video_stride = int(getattr(dl_cfg, "video_stride", 4) or 4) if dl_cfg is not None else 4
+            self._memory_buffer = EpisodeMemoryBuffer(
+                video_stride=video_stride, max_latents=int(arch.memory_cfg.max_latents)
+            )
+            if self._async:
+                raise NotImplementedError("Memory-OpenWAM deploy currently supports the sync executor only.")
         if self._async:
             self._executor = AsyncInferenceExecutor(
                 engine=engine,
@@ -60,6 +75,11 @@ class WAMPolicy:
         values between the two legal commands. Threshold 0.5 preserves the
         downstream command contract for the WS server and direct consumers.
         """
+        if self._memory_buffer is not None:
+            img = obs.get("image")
+            if img is None:
+                raise ValueError("Memory-OpenWAM requires obs['image'] at every control step.")
+            self._memory_buffer.observe(img)
         action = self._executor.predict_action(self._build_conditions(obs))
         dims = getattr(getattr(self.engine, "architecture", None), "binary_command_dims", ()) or ()
         if dims:
@@ -76,6 +96,8 @@ class WAMPolicy:
     def reset(self):
         """Clear executor state between episodes."""
         self._executor.reset()
+        if self._memory_buffer is not None:
+            self._memory_buffer.reset()
 
     def shutdown(self):
         """Release executor resources (background threads in async mode)."""
@@ -99,4 +121,8 @@ class WAMPolicy:
             conditions["prompt"] = obs["prompt"]
         if "state" in obs and obs["state"] is not None:
             conditions["proprio"] = obs["state"]
+        if self._memory_buffer is not None:
+            # Snapshot at replan time; the executor only calls generate when
+            # its action buffer is empty, and the engine encodes the frames.
+            conditions.update(self._memory_buffer.snapshot())
         return conditions

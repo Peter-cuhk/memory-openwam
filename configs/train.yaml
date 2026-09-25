@@ -27,6 +27,7 @@ training:
   # --- Per-module LR (null = use base learning_rate) ---
   action_lr: null                 # Override LR for action model parameters
   video_lr: null                  # Override LR for video backbone parameters
+  memory_lr: null                 # Override LR for Memory-OpenWAM gist tokens / gate (architecture.memory)
 
   # --- DeepSpeed / precision ---
   mixed_precision: bf16           # bf16 / fp16 / no — training + deploy compute dtype

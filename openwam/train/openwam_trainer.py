@@ -410,6 +410,7 @@ class OpenWAMTrainer:
             self,
             action_lr=float(t.action_lr) if getattr(t, "action_lr", None) else None,
             video_lr=float(t.video_lr) if getattr(t, "video_lr", None) else None,
+            memory_lr=float(t.memory_lr) if getattr(t, "memory_lr", None) else None,
         )
         betas = tuple(getattr(t, "adam_betas", [0.9, 0.95]))
         return torch.optim.AdamW(params, lr=float(t.learning_rate), weight_decay=float(t.weight_decay), betas=betas)
@@ -631,6 +632,8 @@ class OpenWAMTrainer:
                 postfix[name] = f"{metrics[key]:.4f}"
             postfix["lr"] = f"{lr:.2e}"
             postfix["epoch"] = epoch
+            if torch.cuda.is_available():
+                postfix["mem"] = f"{torch.cuda.max_memory_allocated() / 2**30:.1f}G"
             pbar.set_postfix(postfix)
             pbar.update(1)
 
@@ -644,6 +647,8 @@ class OpenWAMTrainer:
                 "performance/steps_per_sec": steps_per_sec,
                 "performance/samples_per_sec": steps_per_sec * batch_size * num_procs,
             }
+            if torch.cuda.is_available():
+                log_dict["performance/max_mem_gib"] = torch.cuda.max_memory_allocated() / 2**30
             for name, key in labels:
                 log_dict[f"train/loss_{name}"] = metrics[key]
             wandb_run.log(log_dict, step=global_step)

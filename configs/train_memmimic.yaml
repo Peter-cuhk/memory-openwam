@@ -1,0 +1,62 @@
+# Memory-OpenWAM on MemMimic push_cube, warm-started from the OpenWAM-α foundation model.
+#   source scripts/env.sh
+#   NPROC_PER_NODE=8 bash scripts/train.sh --config-name train_memmimic
+# Config only: python scripts/train.py --config-name train_memmimic --cfg job --resolve
+defaults:
+  - train
+  - override model: dual_system
+  - override dataloader: memmimic
+  - _self_
+
+model:
+  video_backbone:
+    model_path: /mnt/cpfs/shared/models/base/Wan2.2-TI2V-5B
+    from_scratch: false
+  architecture:
+    variant: joint_self_attn
+    action_dim: 80
+    state_dim: 80
+    use_proprioception: true
+    attention_mask_mode: mutual
+    video_attention_mask_mode: first_frame_causal
+    memory:
+      enabled: true
+      gist_tokens: 8
+      max_latents: 40
+      recent_kv: false
+      f_cur_reads_memory: false
+      use_gist_gate: true
+      gate_init: -4.0
+      memory_dropout: 0.1
+      clean_noise_prob: 0.5
+      clean_noise_scale: 0.3
+      action_history: false       # GMP-style: embed each slot's executed commands into its gists (needs dataloader.memory_action_history)
+
+training:
+  debug: false
+  finetune_ckpt_path: /mnt/cpfs/shared/models/base/OpenWAM-Alpha-Pretrain-Foundation-Model
+  resume_ckpt_path: null
+  batch_size: 2
+  gradient_accumulation_steps: 2
+  dataset_num_workers: 4
+  learning_rate: 5e-5
+  video_lr: 2.5e-5
+  action_lr: 5e-5
+  memory_lr: 1e-3                 # gist tokens + gate: tiny param set, needs a much larger LR than the backbones
+  num_epochs: 3
+  max_steps: null
+  mixed_precision: bf16
+  zero_stage: 2
+  use_gradient_checkpointing: true
+  offload_optimizer_device: none
+  save_steps: 1000
+  keep_last_k_ckpts: 5
+  save_full_states_for_resume: false
+
+project:
+  name: memory-openwam
+  seed: 42
+  output_dir: /mnt/cpfs/workspace/memory-openwam/outputs/push_cube
+  wandb:
+    project: memory-openwam
+    run_name: push_cube_gist8

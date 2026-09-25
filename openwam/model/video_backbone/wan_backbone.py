@@ -36,9 +36,14 @@ from openwam.model.video_backbone.wan import conditioning as wan_conditioning
 from openwam.model.video_backbone.wan import dit_forward as wan_dit_forward
 from openwam.model.video_backbone.wan import encode as wan_encode
 from openwam.model.video_backbone.wan import loader
-from openwam.model.video_backbone.wan.models.dit import modulate, rope_apply
+from openwam.model.video_backbone.wan.models.dit import modulate, rope_apply, sinusoidal_embedding_1d
 from openwam.model.video_backbone.wan.preprocess import (
     check_resize_height_width,
+)
+from openwam.model.architectures.utils.memory_layout import (
+    MemoryTokenLayout,
+    build_memory_rope_freqs,
+    build_memory_token_layout,
 )
 from openwam.model.video_backbone.wan.shared.core.gradient.gradient_checkpoint import gradient_checkpoint_forward
 
@@ -459,7 +464,7 @@ class WanBase(VideoBackbone):
                 use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
             )
 
-        return BlockLoopState(
+        state = BlockLoopState(
             hidden_states=hidden_states,
             time_mod=time_modulation,
             rope_freqs=freqs,
@@ -473,6 +478,131 @@ class WanBase(VideoBackbone):
             use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
             extras=extras,
         )
+        memory_latents = kw.get("memory_latents")
+        if memory_latents is not None:
+            state = self._prepend_memory_prefix(
+                state,
+                memory_latents=memory_latents,
+                memory_times=kw["memory_times"],
+                memory_context_index=kw["memory_context_index"],
+                memory_tokens=kw["memory_tokens"],
+                memory_ctx_hide_last_n=int(kw.get("memory_ctx_hide_last_n", 0) or 0),
+                memory_actions=kw.get("memory_actions"),
+            )
+        return state
+
+    # ================================================================
+    # Memory-OpenWAM: memory prefix assembly (see architectures/utils/memory_layout.py)
+    # ================================================================
+
+    @torch.no_grad()
+    def encode_memory_clips(self, clips: list) -> list:
+        """VAE-encode per-sample history clips (``list[list[PIL.Image]]``) into
+        ``(1, z, T_lat, H_lat, W_lat)`` latents. Clips may differ in length, so
+        each sample is encoded on its own; the caller pads."""
+        outs = []
+        for frames in clips:
+            pixels = wan_encode.preprocess_video(frames, encoder=self.video_encoder, dtype=self.dtype, device=self.device)
+            latents = wan_encode.encode_video(pixels, vae=self.vae, encoder=self.video_encoder)
+            outs.append(latents.to(dtype=self.dtype, device=self.device))
+        return outs
+
+    def _prepend_memory_prefix(
+        self,
+        state: BlockLoopState,
+        *,
+        memory_latents: Tensor,
+        memory_times: list,
+        memory_context_index: list,
+        memory_tokens: nn.Module,
+        memory_ctx_hide_last_n: int = 0,
+        memory_actions: Optional[Tensor] = None,
+    ) -> BlockLoopState:
+        """Prepend ``[A | F_1..F_T | G_0..G_T]`` to the window tokens.
+
+        ``memory_latents`` is ``(B, z, T_mem, H, W)`` padded to the longest
+        sample; ``memory_times[b]`` lists the valid slots' absolute latent
+        times. Memory tokens get ``t=0`` modulation and absolute-time RoPE;
+        the window keeps its tokens, per-token ``t_mod`` and head time
+        embedding unchanged (its RoPE is shifted to absolute time ``c``,
+        which leaves all within-window relative positions intact).
+        """
+        dit = state.extras["dit"]
+        if state.vace_hints is not None:
+            raise NotImplementedError("Memory prefix is not supported together with VACE hints.")
+        if state.time_mod.dim() != 4:
+            raise RuntimeError("Memory prefix requires per-token (4D) time modulation on the window tokens.")
+        hidden = state.hidden_states
+        B = hidden.shape[0]
+        if memory_latents.shape[0] != B:
+            raise ValueError(f"memory_latents batch {memory_latents.shape[0]} != window batch {B}")
+        mem = dit.patchify(memory_latents.to(dtype=hidden.dtype, device=hidden.device))
+        _, _, n_slots, mh, mw = mem.shape
+        if (mh, mw) != (state.grid_height, state.grid_width):
+            raise ValueError(
+                f"memory latent grid {(mh, mw)} does not match the window grid {(state.grid_height, state.grid_width)}"
+            )
+        tokens_per_frame = mh * mw
+        layout = build_memory_token_layout(
+            memory_times=memory_times,
+            context_index=memory_context_index,
+            tokens_per_frame=tokens_per_frame,
+            grid_height=mh,
+            grid_width=mw,
+            gist_per_latent=int(memory_tokens.gist_tokens.shape[1]),
+            window_frames=int(state.grid_frames),
+            device=hidden.device,
+        )
+        if layout.n_slots != n_slots:
+            raise ValueError(f"memory_latents has {n_slots} slots but memory_times implies {layout.n_slots}.")
+
+        frame_tokens = rearrange(mem, "b d t h w -> b (t h w) d")
+        gist = memory_tokens.gist_tokens.to(dtype=hidden.dtype, device=hidden.device)
+        gist_tokens = gist[:, None].expand(B, n_slots, -1, -1)
+        if getattr(memory_tokens, "action_history_mlp", None) is not None and memory_actions is None:
+            raise ValueError("memory.action_history=true but no memory_actions reached the backbone.")
+        if memory_actions is not None:
+            # Action history (per slot) is added to every gist of that slot.
+            if memory_actions.shape[:2] != (B, n_slots):
+                raise ValueError(f"memory_actions {tuple(memory_actions.shape)} does not match (B, n_slots)=({B}, {n_slots}).")
+            act = memory_tokens.action_embedding(memory_actions).to(dtype=hidden.dtype, device=hidden.device)
+            gist_tokens = gist_tokens + act[:, :, None, :]
+        gist_tokens = rearrange(gist_tokens, "b t g d -> b (t g) d")
+        state.hidden_states = torch.cat([frame_tokens, gist_tokens, hidden], dim=1)
+
+        # t = 0 modulation for every memory token (clean, like OpenWAM's first frame).
+        zero_t = torch.zeros(B, dtype=state.time_mod.dtype, device=hidden.device)
+        t_embed0 = dit.time_embedding(sinusoidal_embedding_1d(dit.freq_dim, zero_t).to(state.time_mod.dtype))
+        t_mod0 = dit.time_projection(t_embed0).unflatten(1, (6, dit.dim))  # (B, 6, dim)
+        t_mod0 = t_mod0[:, None].expand(B, layout.n_memory, 6, dit.dim)
+        state.time_mod = torch.cat([t_mod0.to(state.time_mod.dtype), state.time_mod], dim=1)
+
+        state.rope_freqs = build_memory_rope_freqs(dit.freqs, layout, device=hidden.device)
+        state.extras["memory_layout"] = layout
+        state.extras["memory_ctx_hide_last_n"] = int(memory_ctx_hide_last_n)
+        return state
+
+    def _memory_context_mask(self, state: BlockLoopState) -> Optional[Tensor]:
+        """Row-wise cross-attention context mask ``(B, L, L_ctx)``.
+
+        Memory-write rows must not read the proprio token(s) appended to the
+        text context: proprio is the state at the window start, i.e. future
+        information for every earlier gist. Returns ``None`` when no memory
+        prefix is present and no per-row masking is needed.
+        """
+        layout: Optional[MemoryTokenLayout] = state.extras.get("memory_layout")
+        hide = int(state.extras.get("memory_ctx_hide_last_n", 0) or 0)
+        if layout is None or hide <= 0:
+            return None
+        B = state.hidden_states.shape[0]
+        L = state.hidden_states.shape[1]
+        L_ctx = state.context.shape[1]
+        base = state.context_mask
+        if base is None:
+            base = torch.ones((B, L_ctx), dtype=torch.bool, device=state.context.device)
+        mask = base.to(torch.bool).unsqueeze(1).expand(B, L, L_ctx).clone()
+        mask[:, : layout.n_memory, L_ctx - hide :] = False
+        return mask
 
     def run_block(self, block_id: int, state: BlockLoopState) -> BlockLoopState:
         dit = state.extras["dit"]
@@ -480,9 +610,13 @@ class WanBase(VideoBackbone):
         attn_mask = state.extras.get("shared_attention_mask")
         context_mask = state.context_mask
 
-        block_context_mask = (
-            context_mask.unsqueeze(1).expand(-1, state.hidden_states.shape[1], -1) if context_mask is not None else None
-        )
+        block_context_mask = self._memory_context_mask(state)
+        if block_context_mask is None:
+            block_context_mask = (
+                context_mask.unsqueeze(1).expand(-1, state.hidden_states.shape[1], -1)
+                if context_mask is not None
+                else None
+            )
         if attn_mask is not None:
             if block_context_mask is None:
                 block_context_mask = (
@@ -576,8 +710,10 @@ class WanBase(VideoBackbone):
         residual_x, gate_msa, shift_mlp, scale_mlp, gate_mlp = post_state
 
         hidden_states = block.gate(residual_x, gate_msa, self_attn.o(attn_out))
-        context_mask = None
-        if state.context_mask is not None:
+        context_mask = self._memory_context_mask(state)
+        if context_mask is not None:
+            context_mask = context_mask.unsqueeze(1)
+        elif state.context_mask is not None:
             context_mask = state.context_mask.unsqueeze(1).expand(-1, hidden_states.shape[1], -1).unsqueeze(1)
         hidden_states = hidden_states + block.cross_attn(
             block.norm3(hidden_states), state.context, ctx_mask=context_mask
@@ -596,7 +732,12 @@ class WanBase(VideoBackbone):
         time_embed = state.extras["time_embed"]
         head_time_embed = time_embed if time_embed.dim() == 3 else time_embed.unsqueeze(1)
 
-        hidden_states = head(state.hidden_states, head_time_embed)
+        hidden_states = state.hidden_states
+        layout: Optional[MemoryTokenLayout] = state.extras.get("memory_layout")
+        if layout is not None:
+            # Only the window tokens are decoded; the memory prefix is dropped.
+            hidden_states = hidden_states[:, layout.window_slice]
+        hidden_states = head(hidden_states, head_time_embed)
 
         hidden_states = dit.unpatchify(hidden_states, (state.grid_frames, state.grid_height, state.grid_width))
         return hidden_states

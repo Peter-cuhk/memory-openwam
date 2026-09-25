@@ -185,8 +185,147 @@ class BaseWAMArchitecture(ABC, nn.Module):
         # to normalize raw robot state into the model's training space.
         self.normalizer = None
 
+        # Memory-OpenWAM (see architectures/utils/memory_layout.py). ``memory``
+        # holds the only new parameters; None when disabled.
+        self.memory: Optional[nn.Module] = None
+        self.memory_cfg = None
+
         if cfg is not None:
             self._init_video_backbone(cfg)
+
+    # --- Memory-OpenWAM ---
+
+    def _init_memory(self, cfg) -> None:
+        """Read ``cfg.memory`` and register the gist parameters (dual_system self-attn only)."""
+        from openwam.model.architectures.utils.memory_tokens import MemoryTokens, parse_memory_config
+
+        raw = self._cfg_get(cfg, "memory", None)
+        mem_cfg = parse_memory_config(raw)
+        self.memory_cfg = mem_cfg
+        if not mem_cfg.enabled:
+            self.memory = None
+            return
+        if self.video_backbone is None:
+            raise RuntimeError("memory.enabled=true requires a video backbone.")
+        self.memory = MemoryTokens(mem_cfg, dim=self.video_backbone.dim, num_layers=self.video_backbone.num_layers)
+
+    @property
+    def memory_enabled(self) -> bool:
+        return self.memory is not None
+
+    def _collect_memory_inputs(self, samples: list[dict]) -> dict:
+        """Encode per-sample history clips into padded memory latents.
+
+        Each sample provides either ``memory_video`` (list[PIL], the episode's
+        stride-sampled frames ``s_0 .. s_{4c}``) or a precomputed
+        ``memory_latents`` tensor ``(z, T, H, W)`` (latent ``k`` = chunk ``k``),
+        plus ``memory_times`` (absolute latent times of the slots to keep; the
+        anchor 0 first) and ``memory_context_index`` (``c``).
+        """
+        vb = self.video_backbone
+        latents_list: list[torch.Tensor] = []
+        times_list: list[list[int]] = []
+        ctx_list: list[int] = []
+        to_encode: list[tuple[int, list]] = []
+        for i, sample in enumerate(samples):
+            times = sample.get("memory_times")
+            ctx = sample.get("memory_context_index")
+            if times is None or ctx is None:
+                raise ValueError(
+                    "memory.enabled=true but the dataset sample carries no memory_times / "
+                    "memory_context_index; use a memory-aware reader (e.g. dataloader=memmimic)."
+                )
+            times_list.append([int(t) for t in times])
+            ctx_list.append(int(ctx))
+            lat = sample.get("memory_latents")
+            if lat is not None:
+                if isinstance(lat, np.ndarray):
+                    lat = torch.from_numpy(lat)
+                latents_list.append(lat.unsqueeze(0) if lat.ndim == 4 else lat)
+            else:
+                frames = sample.get("memory_video")
+                if frames is None:
+                    raise ValueError("memory sample needs memory_latents or memory_video.")
+                latents_list.append(None)
+                to_encode.append((i, frames))
+        if to_encode:
+            encoded = vb.encode_memory_clips([frames for _, frames in to_encode])
+            for (i, _), lat in zip(to_encode, encoded):
+                latents_list[i] = lat
+        # Keep only the requested slots (absolute latent index == chunk index).
+        kept: list[torch.Tensor] = []
+        for lat, times in zip(latents_list, times_list):
+            lat = lat.to(dtype=self.dtype, device=self.device)
+            if lat.ndim != 5:
+                raise ValueError(f"memory latents must be (1, z, T, H, W), got {tuple(lat.shape)}")
+            if max(times) >= lat.shape[2]:
+                raise ValueError(f"memory_times {times} exceed the encoded history length {lat.shape[2]}.")
+            kept.append(lat[:, :, times])
+        n_slots = max(k.shape[2] for k in kept)
+        memory_actions = None
+        if self.memory_cfg is not None and self.memory_cfg.action_history:
+            # Per-slot action history (reader / deploy server), zero-padded like the latents.
+            steps, dim_a = int(self.memory_cfg.action_history_steps), int(self.memory_cfg.action_history_dim)
+            memory_actions = torch.zeros(len(samples), n_slots, steps, dim_a, dtype=torch.float32)
+            for i, (sample, times) in enumerate(zip(samples, times_list)):
+                acts = sample.get("memory_actions")
+                if acts is None:
+                    raise ValueError("memory.action_history=true but the sample carries no memory_actions.")
+                if torch.is_tensor(acts):  # the trainer may already have moved it to the device
+                    acts = acts.detach().to(device="cpu", dtype=torch.float32)
+                else:
+                    acts = torch.as_tensor(np.asarray(acts, dtype=np.float32))
+                if acts.shape != (len(times), steps, dim_a):
+                    raise ValueError(f"memory_actions must be {(len(times), steps, dim_a)}, got {tuple(acts.shape)}.")
+                memory_actions[i, : len(times)] = acts
+            memory_actions = memory_actions.to(device=self.device)
+        padded = []
+        for k in kept:
+            if k.shape[2] < n_slots:
+                pad = torch.zeros(
+                    (k.shape[0], k.shape[1], n_slots - k.shape[2], k.shape[3], k.shape[4]),
+                    dtype=k.dtype,
+                    device=k.device,
+                )
+                k = torch.cat([k, pad], dim=2)
+            padded.append(k)
+        out = {
+            "memory_latents": torch.cat(padded, dim=0),
+            "memory_times": times_list,
+            "memory_context_index": ctx_list,
+        }
+        if memory_actions is not None:
+            out["memory_actions"] = memory_actions
+        return out
+
+    @torch.no_grad()
+    def prepare_memory_inputs(self, samples: list[dict]) -> dict:
+        """Public entry for deploy: samples -> ``memory_latents/memory_times/memory_context_index``."""
+        if self.memory is None:
+            raise RuntimeError("prepare_memory_inputs called on an architecture without memory.")
+        return self._collect_memory_inputs(samples)
+
+    def _augment_memory_inputs(self, forward_inputs: dict) -> None:
+        """Training-time CoCo-style clean-context noise + memory dropout (in place)."""
+        mem_cfg = self.memory_cfg
+        latents = forward_inputs.get("memory_latents")
+        if mem_cfg is None or latents is None or not self.training:
+            return
+        B, _, T, _, _ = latents.shape
+        times = forward_inputs["memory_times"]
+        valid = torch.zeros(B, T, dtype=torch.bool, device=latents.device)
+        for b, t in enumerate(times):
+            valid[b, : len(t)] = True
+        if mem_cfg.clean_noise_prob > 0 and mem_cfg.clean_noise_scale > 0:
+            select = torch.rand(B, T, device=latents.device) < mem_cfg.clean_noise_prob
+            select[:, 0] = False  # anchor stays clean
+            select = select & valid
+            ratio = torch.rand(B, T, device=latents.device, dtype=latents.dtype) * mem_cfg.clean_noise_scale
+            ratio = ratio.view(B, 1, T, 1, 1)
+            mixed = (1.0 - ratio) * latents + ratio * torch.randn_like(latents)
+            forward_inputs["memory_latents"] = torch.where(select.view(B, 1, T, 1, 1), mixed, latents)
+        if mem_cfg.memory_dropout > 0:
+            forward_inputs["memory_reader_sees_memory"] = torch.rand(B, device=latents.device) >= mem_cfg.memory_dropout
 
     @staticmethod
     def _cfg_get(cfg, key, default=None):
@@ -699,6 +838,14 @@ class BaseWAMArchitecture(ABC, nn.Module):
         has_vlm = getattr(self, "vlm_backbone", None) is not None
         has_meta = any(p.device.type == "meta" for p in self.parameters())
         missing, unexpected = self.load_state_dict(state_dict, strict=False, assign=has_meta)
+        if self.memory is not None:
+            # Memory-OpenWAM: the gist parameters are new relative to a
+            # memory-less checkpoint (e.g. the OpenWAM-Alpha foundation model);
+            # keep their fresh init instead of failing the strict load.
+            fresh = [k for k in missing if k.startswith("memory.")]
+            if fresh:
+                logger.info("Memory parameters not in checkpoint, freshly initialized: %s", fresh)
+                missing = [k for k in missing if not k.startswith("memory.")]
         if strict and not has_vlm:
             if missing or unexpected:
                 raise RuntimeError(f"Strict load failed: missing={missing}, unexpected={unexpected}")
@@ -985,6 +1132,9 @@ class BaseWAMArchitecture(ABC, nn.Module):
             "actions": action_data,
         }
 
+        if self.memory is not None:
+            inputs.update(self._collect_memory_inputs(samples))
+
         # Bridge proprio into inputs whenever the batch carries it (not gated on
         # uses_proprioception): the main-stream proprio-context path reads
         # inputs["proprio"]. Consumers that don't need it simply ignore it.
@@ -1004,6 +1154,13 @@ class BaseWAMArchitecture(ABC, nn.Module):
 
         if all_action_masks[0] is not None:
             inputs["action_is_pad"] = torch.stack([~m for m in all_action_masks], dim=0).to(device=_device)
+        step_w = [s.get("action_step_weight") for s in samples]
+        if any(w is not None for w in step_w):
+            if not all(w is not None for w in step_w):
+                raise ValueError("action_step_weight must be set on every sample of a batch or on none.")
+            inputs["action_step_weight"] = torch.stack(
+                [torch.as_tensor(w, dtype=torch.float32).to(_device) for w in step_w], dim=0
+            )
         if all_video_masks[0] is not None:
             # ``latent[0]`` is a clean conditioning frame (and must be excluded
             # from the loss mask) when either:
@@ -1115,7 +1272,9 @@ class BaseWAMArchitecture(ABC, nn.Module):
             action_timesteps = action_scheduler.timesteps[action_timestep_ids].to(dtype=_dtype, device=_device)
             action_sigmas = action_scheduler.sigmas[action_timestep_ids].to(dtype=_dtype, device=_device)
 
-            actions = actions.to(dtype=_dtype, device=_device)
+            # Clean actions, noise and target stay float32 (only the model input is cast): a bf16
+            # target quantizes normalized actions to ~2^-8, i.e. ~0.7 mm per step on MemMimic y.
+            actions = actions.to(dtype=torch.float32, device=_device)
             if actions.dim() == 2:
                 actions = actions.unsqueeze(0)
 
@@ -1124,7 +1283,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
                 a_sigma_bc = action_sigmas.view(B, 1, 1)
             else:
                 a_sigma_bc = action_sigmas.unsqueeze(-1)
-            noisy_actions = action_scheduler.add_noise(actions, action_noise, a_sigma_bc)
+            noisy_actions = action_scheduler.add_noise(actions, action_noise, a_sigma_bc.float()).to(_dtype)
             action_target = action_scheduler.training_target(actions, action_noise)
 
         # --- Joint forward pass ---
@@ -1138,11 +1297,15 @@ class BaseWAMArchitecture(ABC, nn.Module):
         # MoT design, attention itself does not consume sample-level padding.
         forward_inputs.pop("action_is_pad", None)
         forward_inputs.pop("video_is_pad", None)
+        forward_inputs.pop("action_step_weight", None)  # loss-only (per-step action loss weight)
 
         # Route per-sample proprio_mask through pipeline_inputs to
         # ``_append_proprio_context_token``. Internal-only key; pop'd there.
         if proprio_mask is not None:
             forward_inputs["_proprio_sample_mask"] = proprio_mask
+
+        # Memory-OpenWAM training augmentations (no-op when memory is disabled).
+        self._augment_memory_inputs(forward_inputs)
 
         # Use ``self(...)`` (not ``self.forward(...)``) so ``nn.Module.__call__``
         # is invoked and any architecture-level forward-pre-hooks fire.
@@ -1278,6 +1441,14 @@ class BaseWAMArchitecture(ABC, nn.Module):
         if tw.ndim != 1:
             raise ValueError(f"action loss weights must be per-sample [B], got shape {tuple(tw.shape)}")
         per_element = F.mse_loss(noise_pred.float(), target.float(), reduction="none")
+        step_w = inputs.get("action_step_weight")
+        if step_w is not None:
+            # Per-step emphasis (B, T): scales each step's error; the normalizer below stays the
+            # valid-cell count, so weighted steps count more instead of being renormalized away.
+            step_w = step_w.to(device=per_element.device, dtype=per_element.dtype)
+            if step_w.shape != per_element.shape[:2]:
+                raise ValueError(f"action_step_weight {tuple(step_w.shape)} != (B, T) {tuple(per_element.shape[:2])}")
+            per_element = per_element * step_w[:, :, None]
 
         action_is_pad = inputs.get("action_is_pad")
 
@@ -1492,7 +1663,10 @@ class BaseWAMArchitecture(ABC, nn.Module):
             device=device,
             dtype=dtype,
             generator=torch.Generator(device=device).manual_seed(seed),
-        )
+        ).float()
+        # The action sample is integrated in float32 and only cast to the model dtype for the
+        # forward: a bf16 sample quantizes normalized actions to ~2^-8 (0.7 mm per step on
+        # MemMimic y, i.e. ~0.007 m/s of push speed), which is the size of the task's speed grid.
 
         # Unified-action checkpoints scatter raw actions into a larger zero-padded
         # space.  The inactive dimensions may be excluded from the training loss,
@@ -1544,7 +1718,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
                     # _forward_with_cfg runs its own cudagraph_mark_step_begin()
                     # before each inner forward (1 for cfg_merge, 2 for sequential).
                     noise_pred, action_noise_pred = self._forward_with_cfg(
-                        action_latents=action_latents,
+                        action_latents=action_latents.to(dtype),
                         a_timestep=a_timestep,
                         inputs_shared=inputs_shared,
                         v_timestep=v_timestep,
@@ -1554,7 +1728,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
                 else:
                     torch.compiler.cudagraph_mark_step_begin()
                     noise_pred, action_noise_pred = self.forward(
-                        action_latents,
+                        action_latents.to(dtype),
                         a_timestep,
                         **inputs_shared,
                         timestep=v_timestep,
@@ -1577,7 +1751,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
                         raise ValueError("Cannot initialize inactive action noise from a non-positive sigma.")
                     inactive_action_noise = action_latents[..., inactive_action_dims].detach().clone() / sigma_a_f
                 action_latents = self.action_scheduler.flow_step(
-                    action_noise_pred, sigma_a, sigma_a_next, action_latents
+                    action_noise_pred.float(), sigma_a, sigma_a_next, action_latents
                 )
                 if inactive_action_dims is not None:
                     action_latents[..., inactive_action_dims] = inactive_action_noise * float(sigma_a_next)

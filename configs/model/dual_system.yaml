@@ -38,3 +38,18 @@ architecture:
   mot_checkpoint_mixed_attn: true  # joint_self_attn/idm only: grad-checkpoint the mixed attention (VRAM down)
   detach_bridge: false             # joint_cross_attn only
   idm_video_cond_noise_prob: 0.5   # idm only
+
+  # Memory-OpenWAM (joint_self_attn only): CoCo MemoryWAM-style episode memory on the
+  # video side — anchor latent + per-latent gist tokens + role-aware joint mask.
+  # Requires a memory-aware dataloader (memory_times / memory_context_index per sample).
+  memory:
+    enabled: false
+    gist_tokens: 8            # learnable gist tokens per memory latent
+    max_latents: 40           # memory slots kept (anchor + newest); same at train and deploy
+    recent_kv: false          # also expose the last history chunk F_c to the readers
+    f_cur_reads_memory: false # let the clean conditioning frame read the memory
+    use_gist_gate: true       # per-layer additive gate on reader->gist logits
+    gate_init: -4.0           # gate init (negative = start as vanilla OpenWAM; ~e^-4 relative gist weight)
+    memory_dropout: 0.0       # p(hide memory from readers) per sample, train only
+    clean_noise_prob: 0.0     # CoCo clean-context noise on history latents (anchor stays clean)
+    clean_noise_scale: 0.0
