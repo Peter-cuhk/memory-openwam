@@ -42,6 +42,11 @@ class MemoryConfig:
     action_history_noise_offset: float = 0.0
     action_history_noise_drift: float = 0.0
     action_history_dropout: float = 0.0
+    # Experiment B (2026-09-27): keep every slot, its time (RoPE) and its action history, but replace each history
+    # slot's (t > 0) video latent by the anchor latent (detached), so the only image the memory ever sees is the
+    # first frame. Applied in the backbone right before the memory rows are built (train, recompute, prefix_once,
+    # streaming alike); see ``blind_history_latents``.
+    history_video_blind: bool = False
 
     def __post_init__(self) -> None:
         if self.gist_tokens <= 0:
@@ -87,6 +92,28 @@ def parse_memory_config(raw: Any) -> MemoryConfig:
     return MemoryConfig(**kwargs)
 
 
+def blind_history_latents(latents: torch.Tensor, memory_times) -> torch.Tensor:
+    """``memory.history_video_blind``: every real history slot (time > 0) takes the anchor slot's latent.
+
+    ``latents`` is ``(B, z, S, H, W)`` with slot 0 = the anchor (time 0); ``memory_times[b]`` lists sample ``b``'s
+    valid slots (a shorter list = zero padding, left as is). The anchor is copied detached; slot count, times and
+    action history are untouched, so only the history *images* are removed from the memory.
+    """
+    if latents.ndim != 5:
+        raise ValueError(f"memory latents must be (B, z, S, H, W), got {tuple(latents.shape)}")
+    B, _, S = latents.shape[:3]
+    if len(memory_times) != B:
+        raise ValueError(f"memory_times has {len(memory_times)} samples for a batch of {B}.")
+    hist = torch.zeros(B, S, dtype=torch.bool, device=latents.device)
+    for b, times in enumerate(memory_times):
+        times = [int(t) for t in times]
+        if not times or times[0] != 0 or len(times) > S:
+            raise ValueError(f"memory_times[{b}]={times}: slot 0 must be the anchor (time 0), at most {S} slots.")
+        hist[b, 1 : len(times)] = True
+    anchor = latents[:, :, :1].detach().expand_as(latents)
+    return torch.where(hist.view(B, 1, S, 1, 1), anchor, latents)
+
+
 class MemoryTokens(nn.Module):
     """Learnable gist tokens (+ optional per-layer read gate, + optional action-history embedding)."""
 
@@ -124,4 +151,4 @@ class MemoryTokens(nn.Module):
         return self.gist_gate
 
 
-__all__ = ["MemoryConfig", "MemoryTokens", "parse_memory_config"]
+__all__ = ["MemoryConfig", "MemoryTokens", "blind_history_latents", "parse_memory_config"]

@@ -50,9 +50,15 @@ from openwam.model.architectures.utils.memory_layout import (
     build_memory_video_mask,
     memory_reader_key_index,
 )
+from openwam.model.architectures.utils.memory_tokens import blind_history_latents
 from openwam.model.video_backbone.wan.shared.core.gradient.gradient_checkpoint import gradient_checkpoint_forward
 
 logger = logging.getLogger(__name__)
+
+
+def _history_video_blind(memory_tokens) -> bool:
+    """``memory.history_video_blind`` of the MemoryTokens module (False when absent)."""
+    return bool(getattr(getattr(memory_tokens, "cfg", None), "history_video_blind", False))
 
 
 class WanBase(VideoBackbone):
@@ -553,6 +559,8 @@ class WanBase(VideoBackbone):
         B = hidden.shape[0]
         if memory_latents.shape[0] != B:
             raise ValueError(f"memory_latents batch {memory_latents.shape[0]} != window batch {B}")
+        if _history_video_blind(memory_tokens):
+            memory_latents = blind_history_latents(memory_latents, memory_times)
         mem = dit.patchify(memory_latents.to(dtype=hidden.dtype, device=hidden.device))
         _, _, n_slots, mh, mw = mem.shape
         if (mh, mw) != (state.grid_height, state.grid_width):
@@ -758,9 +766,10 @@ class WanBase(VideoBackbone):
             stream.frame_kv = [None] * n_layers
         t_mod0 = self._memory_t_mod0(dit, 1, dtype=state.time_mod.dtype, device=hidden.device)
         n_frame_mem = layout.n_slots * tpf
+        blind = _history_video_blind(memory_tokens)
         for t in range(stream.n_written, upto + 1):
             frame, gist = self._memory_slot_tokens(
-                dit, stream.latents_at([t]), memory_tokens, dtype=hidden.dtype, device=hidden.device
+                dit, stream.latents_at([0 if blind else t]), memory_tokens, dtype=hidden.dtype, device=hidden.device
             )
             x = torch.cat([frame, gist], dim=1)
             rows = torch.cat(
@@ -797,9 +806,10 @@ class WanBase(VideoBackbone):
         columns' K/V per layer. Works for any layout, including truncated ones."""
         dit = state.extras["dit"]
         hidden = state.hidden_states
-        frame, gist = self._memory_slot_tokens(
-            dit, stream.latents_at(times), memory_tokens, dtype=hidden.dtype, device=hidden.device
-        )
+        latents = stream.latents_at(times)
+        if _history_video_blind(memory_tokens):
+            latents = blind_history_latents(latents, [times])
+        frame, gist = self._memory_slot_tokens(dit, latents, memory_tokens, dtype=hidden.dtype, device=hidden.device)
         x = torch.cat([frame, gist], dim=1)
         n_mem = layout.n_memory
         t_mod0 = self._memory_t_mod0(dit, 1, dtype=state.time_mod.dtype, device=hidden.device)

@@ -155,6 +155,8 @@ class MemMimicPolicyServer:
         self.dump_dir = None
         # dim -> value written into the action history instead of the model's raw output (see --history-fixed-dims)
         self.history_fixed_dims: dict[int, float] = {}
+        # simulator action-smoothing weight replayed on the xyz written into the action history (see --history-smooth)
+        self.history_smooth = 0.0
         # Phase 2 (memory-openwam/docs/07): "recompute" re-encodes the history and re-runs the memory
         # prefix at every denoising step (the original path); "prefix_once" runs it once per request;
         # "streaming" keeps per-episode K/V and writes one latent per request. stream_vae encodes only
@@ -382,6 +384,17 @@ class MemMimicPolicyServer:
 
             # The simulator executes the first exec_horizon commands of this chunk before the next request.
             executed = actions[: self.exec_horizon].copy()
+            if self.history_smooth > 0:
+                # What the simulator actually runs (GMP ManipulationPolicyParallelAgent): s_i = (1 - 2w) a_i +
+                # w a_{i-1} + w a_{i+1}, with a_{-1} = the last command it executed; the last command of the
+                # prediction horizon is left as is.
+                w, n = self.history_smooth, len(executed)
+                prev = st.get("last_exec_xyz", np.asarray(conditions["proprio"], np.float32).reshape(-1, POSE10_DIM)[-1, :3])
+                before = np.concatenate([np.asarray(prev, np.float32)[None], actions[: n - 1, :3]], 0)
+                after = actions[1 : n + 1, :3]
+                m = len(after)
+                executed[:m, :3] = (1 - 2 * w) * actions[:m, :3] + w * before[:m] + w * after
+                st["last_exec_xyz"] = executed[-1, :3].copy()
             for d, v in self.history_fixed_dims.items():
                 executed[:, d] = v
             st.setdefault("executed", []).append(
@@ -505,6 +518,14 @@ def main() -> None:
         "only moves y). Delta models normalize the history with the state stats, whose x / z / gripper ranges are "
         "sub-mm, so raw output jitter would otherwise be clipped to +-1 there.",
     )
+    ap.add_argument(
+        "--history-smooth",
+        type=float,
+        default=0.0,
+        help="action history: record the xyz the simulator actually executes after its action smoothing "
+        "(GMP push_cube task.agent.smoothen_action_weight = 0.2) instead of the raw commands. The expert demos were "
+        "collected without smoothing, so in training the recorded commands are exactly what moved the cube.",
+    )
     ap.add_argument("--stream-vae", action="store_true", help="encode only new history chunks (implied by the KV modes)")
     ap.add_argument("--timing-jsonl", default=None, help="append per-request timing / peak memory records here")
     ap.add_argument(
@@ -531,10 +552,14 @@ def main() -> None:
     for item in filter(None, (x.strip() for x in args.history_fixed_dims.split(","))):
         d, v = item.split("=")
         server.history_fixed_dims[int(d)] = float(v)
+    if not 0.0 <= args.history_smooth < 0.5:
+        raise ValueError("--history-smooth must be in [0, 0.5)")
+    server.history_smooth = float(args.history_smooth)
     server.configure_memory_inference(args.memory_inference, stream_vae=args.stream_vae, timing_path=args.timing_jsonl)
     logger.info(
-        "memory ablation: %s | action samples averaged: %d | history fixed dims: %s | memory inference: %s (stream VAE %s)",
-        server.memory_ablation, server.action_samples, server.history_fixed_dims or "none",
+        "memory ablation: %s | action samples averaged: %d | history fixed dims: %s | history smooth: %s | "
+        "memory inference: %s (stream VAE %s)",
+        server.memory_ablation, server.action_samples, server.history_fixed_dims or "none", server.history_smooth,
         server.memory_inference, server.stream_vae,
     )
     server.run()
