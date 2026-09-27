@@ -335,6 +335,56 @@ def build_gist_gate_selector(
     return sel[:, None]
 
 
+def memory_reader_key_index(layout: MemoryTokenLayout, *, recent_kv: bool = False) -> Tensor:
+    """Memory-prefix columns any reader row can see, in the order a streamed KV cache stores them:
+    anchor frame tokens, then every gist (slot order), then ``F_c`` when ``recent_kv``.
+
+    Readers never see the other history frames, so a deploy-time KV cache only needs these columns.
+    """
+    if layout.batch_size != 1:
+        raise ValueError("memory_reader_key_index expects a single-sample layout.")
+    idx = [
+        layout.is_role(MemoryRole.ANCHOR).nonzero().flatten(),
+        layout.is_role(MemoryRole.GIST).nonzero().flatten(),
+    ]
+    if recent_kv:
+        c = int(layout.context_index[0])
+        idx.append((layout.is_role(MemoryRole.HIST_FRAME) & (layout.time[0] == c)).nonzero().flatten())
+    return torch.cat(idx)
+
+
+def build_memory_reader_mask(
+    layout: MemoryTokenLayout,
+    s_action: int,
+    key_index: Tensor,
+    *,
+    mode: str,
+    f_cur_reads_memory: bool = False,
+    recent_kv: bool = False,
+    with_gate: bool = False,
+) -> tuple[Tensor, Optional[Tensor]]:
+    """Reader-row slice of :func:`build_memory_joint_mask` for a KV-cached memory prefix.
+
+    Rows are ``[window | action]`` (the memory rows are gone: their K/V are cached), columns are
+    ``[key_index | window | action]``. Returns ``(mask, gate_selector)``; the mask is additive
+    float32 when ``with_gate`` (as in the parallel path) and bool otherwise. Slicing the training
+    mask keeps the visibility rules in one place.
+    """
+    full = build_memory_joint_mask(
+        layout, s_action, mode=mode, f_cur_reads_memory=f_cur_reads_memory, recent_kv=recent_kv
+    )
+    S = full.shape[-1]
+    rows = torch.arange(layout.n_memory, S, device=full.device)
+    cols = torch.cat([key_index.to(full.device), rows])
+    mask = full[:, :, rows][:, :, :, cols]
+    selector = None
+    if with_gate:
+        sel = build_gist_gate_selector(layout, s_action, f_cur_reads_memory=f_cur_reads_memory)
+        selector = sel[:, :, rows][:, :, :, cols]
+        mask = bool_mask_to_additive(mask, torch.float32)
+    return mask, selector
+
+
 def bool_mask_to_additive(mask: Tensor, dtype: torch.dtype) -> Tensor:
     """True -> 0, False -> -inf, as a float mask SDPA can add to the logits."""
     return torch.zeros(mask.shape, dtype=dtype, device=mask.device).masked_fill(~mask, float("-inf"))
@@ -385,6 +435,8 @@ __all__ = [
     "build_memory_video_mask",
     "build_memory_joint_mask",
     "build_gist_gate_selector",
+    "memory_reader_key_index",
+    "build_memory_reader_mask",
     "bool_mask_to_additive",
     "build_memory_rope_freqs",
 ]

@@ -335,7 +335,19 @@ class JointInferenceEngine(BaseInferenceEngine):
         # Memory-OpenWAM: encode the episode history (real observations only)
         # into padded memory latents; forwarded through generate(**extra).
         memory_kwargs = {}
-        if conditions.get("memory_video") is not None or conditions.get("memory_latents") is not None:
+        if conditions.get("memory_stream") is not None:
+            # Phase 2: per-episode KV cache (openwam/model/architectures/utils/memory_stream.py); its
+            # latents come from the caller's streaming VAE, so nothing is re-encoded here.
+            if not getattr(self.architecture, "memory_enabled", False):
+                raise RuntimeError("memory inputs were provided but the loaded architecture has no memory.")
+            if conditions.get("memory_actions") is not None:
+                raise NotImplementedError("memory_stream does not support memory.action_history.")
+            memory_kwargs = {
+                "memory_stream": conditions["memory_stream"],
+                "memory_times": [[int(t) for t in conditions["memory_times"]]],
+                "memory_context_index": [int(conditions["memory_context_index"])],
+            }
+        elif conditions.get("memory_video") is not None or conditions.get("memory_latents") is not None:
             if not getattr(self.architecture, "memory_enabled", False):
                 raise RuntimeError("memory inputs were provided but the loaded architecture has no memory.")
             sample = {

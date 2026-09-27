@@ -15,12 +15,14 @@ code reaches them only through the ABC methods.
 
 from __future__ import annotations
 
+import copy
 import logging
 import os
 from typing import Callable, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from einops import rearrange
 from torch import Tensor
 
@@ -42,8 +44,11 @@ from openwam.model.video_backbone.wan.preprocess import (
 )
 from openwam.model.architectures.utils.memory_layout import (
     MemoryTokenLayout,
+    bool_mask_to_additive,
     build_memory_rope_freqs,
     build_memory_token_layout,
+    build_memory_video_mask,
+    memory_reader_key_index,
 )
 from openwam.model.video_backbone.wan.shared.core.gradient.gradient_checkpoint import gradient_checkpoint_forward
 
@@ -479,6 +484,9 @@ class WanBase(VideoBackbone):
             extras=extras,
         )
         memory_latents = kw.get("memory_latents")
+        memory_stream = kw.get("memory_stream")
+        if memory_latents is not None and memory_stream is not None:
+            raise ValueError("Pass either memory_latents (parallel prefix) or memory_stream (KV cache), not both.")
         if memory_latents is not None:
             state = self._prepend_memory_prefix(
                 state,
@@ -488,6 +496,15 @@ class WanBase(VideoBackbone):
                 memory_tokens=kw["memory_tokens"],
                 memory_ctx_hide_last_n=int(kw.get("memory_ctx_hide_last_n", 0) or 0),
                 memory_actions=kw.get("memory_actions"),
+            )
+        elif memory_stream is not None:
+            state = self._attach_memory_stream(
+                state,
+                stream=memory_stream,
+                memory_times=kw["memory_times"],
+                memory_context_index=kw["memory_context_index"],
+                memory_tokens=kw["memory_tokens"],
+                memory_ctx_hide_last_n=int(kw.get("memory_ctx_hide_last_n", 0) or 0),
             )
         return state
 
@@ -571,9 +588,7 @@ class WanBase(VideoBackbone):
         state.hidden_states = torch.cat([frame_tokens, gist_tokens, hidden], dim=1)
 
         # t = 0 modulation for every memory token (clean, like OpenWAM's first frame).
-        zero_t = torch.zeros(B, dtype=state.time_mod.dtype, device=hidden.device)
-        t_embed0 = dit.time_embedding(sinusoidal_embedding_1d(dit.freq_dim, zero_t).to(state.time_mod.dtype))
-        t_mod0 = dit.time_projection(t_embed0).unflatten(1, (6, dit.dim))  # (B, 6, dim)
+        t_mod0 = self._memory_t_mod0(dit, B, dtype=state.time_mod.dtype, device=hidden.device)
         t_mod0 = t_mod0[:, None].expand(B, layout.n_memory, 6, dit.dim)
         state.time_mod = torch.cat([t_mod0.to(state.time_mod.dtype), state.time_mod], dim=1)
 
@@ -582,26 +597,256 @@ class WanBase(VideoBackbone):
         state.extras["memory_ctx_hide_last_n"] = int(memory_ctx_hide_last_n)
         return state
 
+    @staticmethod
+    def _memory_t_mod0(dit, batch: int, *, dtype, device) -> Tensor:
+        """``(B, 6, dim)`` t = 0 modulation shared by every memory token."""
+        zero_t = torch.zeros(batch, dtype=dtype, device=device)
+        t_embed0 = dit.time_embedding(sinusoidal_embedding_1d(dit.freq_dim, zero_t).to(dtype))
+        return dit.time_projection(t_embed0).unflatten(1, (6, dit.dim))
+
+    @staticmethod
+    def _memory_slot_tokens(dit, latents: Tensor, memory_tokens: nn.Module, *, dtype, device) -> Tuple[Tensor, Tensor]:
+        """Frame tokens ``(1, T*tpf, D)`` and gist tokens ``(1, T*g, D)`` of history latents ``(1, z, T, H, W)``,
+        built exactly as in :meth:`_prepend_memory_prefix`."""
+        mem = dit.patchify(latents.to(dtype=dtype, device=device))
+        frame_tokens = rearrange(mem, "b d t h w -> b (t h w) d")
+        gist = memory_tokens.gist_tokens.to(dtype=dtype, device=device)
+        gist_tokens = rearrange(gist[:, None].expand(1, latents.shape[2], -1, -1), "b t g d -> b (t g) d")
+        return frame_tokens, gist_tokens
+
+    def _memory_rows_forward(
+        self,
+        state: BlockLoopState,
+        hidden: Tensor,
+        t_mod: Tensor,
+        freqs: Tensor,
+        *,
+        keep: Callable[[int, Tensor, Tensor], None],
+        prefix_kv: Optional[Callable[[int], Optional[Tuple[Tensor, Tensor]]]] = None,
+        self_mask: Optional[Tensor] = None,
+    ) -> None:
+        """Run memory-write rows through every block and hand each layer's post-RoPE K/V to ``keep``.
+
+        ``prefix_kv(layer)`` returns cached keys/values the rows attend to without a mask;
+        ``self_mask`` (``(1, 1, S, S)``, bool or additive) restricts the rows among themselves.
+        Uses the same pre/post-attention halves as the MoT driver, so the arithmetic matches the
+        parallel prefix. The last block's attention/FFN are skipped: only its K/V are read.
+        """
+        dit = state.extras["dit"]
+        ws = copy.copy(state)
+        ws.extras = {k: v for k, v in state.extras.items() if k not in ("memory_stream", "memory_layout")}
+        ws.extras["memory_write_rows"] = True  # cross-attn hides proprio on every row
+        ws.hidden_states, ws.time_mod, ws.rope_freqs, ws.vace_hints = hidden, t_mod, freqs, None
+        n_layers = len(dit.blocks)
+        n_heads = self.num_heads
+        for layer_id in range(n_layers):
+            q, k, v, post = self.pre_attn_at_layer_for_compile(layer_id, ws)
+            cached = prefix_kv(layer_id) if prefix_kv is not None else None
+            keep(layer_id, k, v)
+            if layer_id == n_layers - 1:
+                break
+            if cached is not None:
+                k = torch.cat([cached[0], k], dim=1)
+                v = torch.cat([cached[1], v], dim=1)
+            qh, kh, vh = (rearrange(t, "b s (n d) -> b n s d", n=n_heads) for t in (q, k, v))
+            mask = self_mask
+            if mask is not None and mask.dtype != torch.bool:
+                mask = mask.to(dtype=qh.dtype)
+            out = F.scaled_dot_product_attention(qh, kh, vh, attn_mask=mask)
+            out = rearrange(out, "b n s d -> b s (n d)", n=n_heads)
+            ws = self.post_attn_at_layer_for_compile(layer_id, ws, out.contiguous(), post)
+
+    def _attach_memory_stream(
+        self,
+        state: BlockLoopState,
+        *,
+        stream,
+        memory_times: list,
+        memory_context_index: list,
+        memory_tokens: nn.Module,
+        memory_ctx_hide_last_n: int = 0,
+    ) -> BlockLoopState:
+        """KV-cached counterpart of :meth:`_prepend_memory_prefix` (deploy, one episode).
+
+        The window keeps its tokens; the memory prefix reaches every layer only as cached K/V
+        (``stream.read_kv``, prepended in :meth:`pre_attn_at_layer`). The K/V are built on the
+        first denoising step of a request and reused by the others. See
+        ``architectures/utils/memory_stream.py`` for the two modes.
+        """
+        dit = state.extras["dit"]
+        if state.vace_hints is not None:
+            raise NotImplementedError("Memory stream is not supported together with VACE hints.")
+        if state.time_mod.dim() != 4:
+            raise RuntimeError("Memory stream requires per-token (4D) time modulation on the window tokens.")
+        hidden = state.hidden_states
+        if hidden.shape[0] != 1 or len(memory_times) != 1 or len(memory_context_index) != 1:
+            raise ValueError("memory_stream serves one episode at a time (batch size 1).")
+        if getattr(memory_tokens, "action_history_mlp", None) is not None:
+            raise NotImplementedError("memory_stream does not support memory.action_history.")
+        times = [int(t) for t in memory_times[0]]
+        c = int(memory_context_index[0])
+        recent_kv = bool(memory_tokens.cfg.recent_kv)
+        state.extras["memory_stream"] = stream
+        state.extras["memory_ctx_hide_last_n"] = int(memory_ctx_hide_last_n)
+
+        request_key = (tuple(times), c, int(state.grid_frames), int(state.grid_height), int(state.grid_width))
+        if stream.request_key != request_key:
+            if stream.mode == "streaming":
+                self._check_stream_text_context(state, stream, int(memory_ctx_hide_last_n))
+            layout = build_memory_token_layout(
+                memory_times=[times],
+                context_index=[c],
+                tokens_per_frame=int(state.grid_height * state.grid_width),
+                grid_height=int(state.grid_height),
+                grid_width=int(state.grid_width),
+                gist_per_latent=int(memory_tokens.gist_tokens.shape[1]),
+                window_frames=int(state.grid_frames),
+                device=hidden.device,
+            )
+            freqs = build_memory_rope_freqs(dit.freqs, layout, device=hidden.device)
+            key_index = memory_reader_key_index(layout, recent_kv=recent_kv)
+            if stream.mode == "streaming" and times == list(range(c + 1)):
+                self._memory_stream_write(state, stream, layout, freqs, memory_tokens, upto=c)
+                read = []
+                for layer_id in range(len(dit.blocks)):
+                    parts = [stream.anchor_kv[layer_id], *stream.gist_kv[layer_id]]
+                    if recent_kv and c >= 1:
+                        parts.append(stream.frame_kv[layer_id])
+                    read.append((torch.cat([p[0] for p in parts], dim=1), torch.cat([p[1] for p in parts], dim=1)))
+            else:
+                # prefix_once, or a truncated layout (c + 1 > max_latents) that a stream cannot reproduce.
+                read = self._memory_prefix_kv(state, stream, layout, freqs, memory_tokens, times, key_index)
+                stream.stats["prefix_rebuilds"] += 1
+            stream.read_kv = read
+            stream.layout = layout
+            stream.key_index = key_index
+            stream.window_freqs = freqs[:, layout.window_slice]
+            stream.reader_masks = {}
+            stream.request_key = request_key
+            stream.stats["requests"] += 1
+        state.rope_freqs = stream.window_freqs
+        return state
+
+    @staticmethod
+    def _check_stream_text_context(state: BlockLoopState, stream, hide: int) -> None:
+        """Cached memory K/V read the text context (not the trailing proprio token), so a stream is
+        only valid for one prompt. Fail loudly instead of mixing K/V written under another prompt."""
+        n_text = state.context.shape[1] - hide
+        text = state.context[:, :n_text]
+        mask = None if state.context_mask is None else state.context_mask[:, :n_text]
+        if stream.context_ref is None:
+            stream.context_ref = (text, mask)
+            return
+        ref_text, ref_mask = stream.context_ref
+        same_mask = (ref_mask is None) == (mask is None) and (mask is None or torch.equal(ref_mask, mask))
+        if ref_text.shape != text.shape or not same_mask or not torch.allclose(ref_text, text, atol=1e-3, rtol=1e-3):
+            raise ValueError(
+                "memory_stream: the text context changed within an episode; cached memory K/V depend on it. "
+                "Reset the stream at every episode start and keep one prompt per episode."
+            )
+
+    def _memory_stream_write(self, state, stream, layout, freqs, memory_tokens, *, upto: int) -> None:
+        """Write slots ``stream.n_written .. upto`` one at a time: queries ``[F_t | G_t]``, keys the
+        anchor, ``F_{t-1}``, ``G_{<t}`` and themselves — exactly the memory-row visibility, all open."""
+        dit = state.extras["dit"]
+        n_layers = len(dit.blocks)
+        hidden = state.hidden_states
+        tpf, g = layout.tokens_per_frame, layout.gist_per_latent
+        if stream.n_written == 0:
+            stream.anchor_kv = [None] * n_layers
+            stream.gist_kv = [[] for _ in range(n_layers)]
+            stream.frame_kv = [None] * n_layers
+        t_mod0 = self._memory_t_mod0(dit, 1, dtype=state.time_mod.dtype, device=hidden.device)
+        n_frame_mem = layout.n_slots * tpf
+        for t in range(stream.n_written, upto + 1):
+            frame, gist = self._memory_slot_tokens(
+                dit, stream.latents_at([t]), memory_tokens, dtype=hidden.dtype, device=hidden.device
+            )
+            x = torch.cat([frame, gist], dim=1)
+            rows = torch.cat(
+                [torch.arange(t * tpf, (t + 1) * tpf), torch.arange(n_frame_mem + t * g, n_frame_mem + (t + 1) * g)]
+            ).to(freqs.device)
+            t_mod = t_mod0[:, None].expand(1, x.shape[1], 6, dit.dim).to(state.time_mod.dtype)
+            new_frame: list = [None] * n_layers
+
+            def prefix(layer_id: int, t: int = t):
+                if t == 0:
+                    return None
+                parts = [stream.anchor_kv[layer_id]]
+                if t >= 2:
+                    parts.append(stream.frame_kv[layer_id])
+                parts.extend(stream.gist_kv[layer_id])
+                return torch.cat([p[0] for p in parts], dim=1), torch.cat([p[1] for p in parts], dim=1)
+
+            def keep(layer_id: int, k: Tensor, v: Tensor, t: int = t) -> None:
+                # Clone: a view would pin the slot's whole (frame + gist) K/V for the rest of the episode.
+                if t == 0:
+                    stream.anchor_kv[layer_id] = (k[:, :tpf].clone(), v[:, :tpf].clone())
+                else:
+                    new_frame[layer_id] = (k[:, :tpf].clone(), v[:, :tpf].clone())
+                stream.gist_kv[layer_id].append((k[:, tpf:].clone(), v[:, tpf:].clone()))
+
+            self._memory_rows_forward(state, x, t_mod, freqs[:, rows], keep=keep, prefix_kv=prefix)
+            if t > 0:
+                stream.frame_kv = new_frame
+            stream.n_written = t + 1
+            stream.stats["slots_written"] += 1
+
+    def _memory_prefix_kv(self, state, stream, layout, freqs, memory_tokens, times, key_index) -> list:
+        """All memory rows at once (the training prefix without the window): returns the reader
+        columns' K/V per layer. Works for any layout, including truncated ones."""
+        dit = state.extras["dit"]
+        hidden = state.hidden_states
+        frame, gist = self._memory_slot_tokens(
+            dit, stream.latents_at(times), memory_tokens, dtype=hidden.dtype, device=hidden.device
+        )
+        x = torch.cat([frame, gist], dim=1)
+        n_mem = layout.n_memory
+        t_mod0 = self._memory_t_mod0(dit, 1, dtype=state.time_mod.dtype, device=hidden.device)
+        t_mod = t_mod0[:, None].expand(1, n_mem, 6, dit.dim).to(state.time_mod.dtype)
+        cfg = memory_tokens.cfg
+        mask = build_memory_video_mask(layout, f_cur_reads_memory=bool(cfg.f_cur_reads_memory), recent_kv=bool(cfg.recent_kv))
+        mask = mask[:, :n_mem, :n_mem][:, None]
+        if memory_tokens.gate is not None:
+            mask = bool_mask_to_additive(mask, torch.float32)  # as the parallel (gist-gated) path
+        idx = key_index.to(hidden.device)
+        read: list = [None] * len(dit.blocks)
+
+        def keep(layer_id: int, k: Tensor, v: Tensor) -> None:
+            read[layer_id] = (k[:, idx], v[:, idx])
+
+        self._memory_rows_forward(state, x, t_mod, freqs[:, :n_mem], keep=keep, self_mask=mask)
+        return read
+
     def _memory_context_mask(self, state: BlockLoopState) -> Optional[Tensor]:
         """Row-wise cross-attention context mask ``(B, L, L_ctx)``.
 
         Memory-write rows must not read the proprio token(s) appended to the
         text context: proprio is the state at the window start, i.e. future
         information for every earlier gist. Returns ``None`` when no memory
-        prefix is present and no per-row masking is needed.
+        prefix is present and no per-row masking is needed. Under a memory
+        stream the rows are either all readers (window) or all writers.
         """
         layout: Optional[MemoryTokenLayout] = state.extras.get("memory_layout")
         hide = int(state.extras.get("memory_ctx_hide_last_n", 0) or 0)
-        if layout is None or hide <= 0:
+        if hide <= 0:
             return None
         B = state.hidden_states.shape[0]
         L = state.hidden_states.shape[1]
+        if state.extras.get("memory_write_rows"):
+            n_hidden_rows = L
+        elif layout is not None:
+            n_hidden_rows = layout.n_memory
+        elif state.extras.get("memory_stream") is not None:
+            n_hidden_rows = 0
+        else:
+            return None
         L_ctx = state.context.shape[1]
         base = state.context_mask
         if base is None:
             base = torch.ones((B, L_ctx), dtype=torch.bool, device=state.context.device)
         mask = base.to(torch.bool).unsqueeze(1).expand(B, L, L_ctx).clone()
-        mask[:, : layout.n_memory, L_ctx - hide :] = False
+        mask[:, :n_hidden_rows, L_ctx - hide :] = False
         return mask
 
     def run_block(self, block_id: int, state: BlockLoopState) -> BlockLoopState:
@@ -643,6 +888,13 @@ class WanBase(VideoBackbone):
         mixed attention; pairs with :meth:`post_attn_at_layer`.
         """
         q, k, v, post_tuple = self.pre_attn_at_layer_for_compile(layer_id, state)
+        memory_stream = state.extras.get("memory_stream")
+        if memory_stream is not None:
+            # KV-cached memory prefix: keys without query rows, ahead of the window's own keys
+            # (column order matches build_memory_reader_mask).
+            mem_k, mem_v = memory_stream.layer_kv(layer_id)
+            k = torch.cat([mem_k, k], dim=1)
+            v = torch.cat([mem_v, v], dim=1)
         residual_x, gate_msa, shift_mlp, scale_mlp, gate_mlp = post_tuple
         block = state.extras["dit"].blocks[layer_id]
         post_state = {
