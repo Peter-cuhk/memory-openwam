@@ -19,6 +19,10 @@ PORT=${PORT:-18765}
 DEVICE=${DEVICE:-cuda:0}
 CKPT_NAME=${CKPT_NAME:-}
 START_SEED=${START_SEED:-10005}
+# Memory inference path (memory-openwam/docs/07). Default "auto" = the streaming KV path whenever the
+# checkpoint allows it (memory on, no action history, no eval-time ablation), else the original
+# recompute path. Anything in SERVER_ARGS comes later on the command line and overrides it.
+MEMORY_INFERENCE=${MEMORY_INFERENCE:-auto}
 OUT=$OUT_ROOT/$RUN
 mkdir -p "$OUT"
 
@@ -40,7 +44,8 @@ echo "[eval] ckpt=$CKPT_DIR run=$RUN episodes=$EPISODES env_num=$ENV_NUM out=$OU
   export TMPDIR=/tmp
   exec .venv/bin/python benchmarks/memmimic/robotmq_policy_server.py \
     --ckpt-dir "$CKPT_DIR" ${CKPT_NAME:+--ckpt-name "$CKPT_NAME"} \
-    --device "$DEVICE" --endpoint "tcp://0.0.0.0:$PORT" ${SERVER_ARGS:-}
+    --device "$DEVICE" --endpoint "tcp://0.0.0.0:$PORT" \
+    --memory-inference "$MEMORY_INFERENCE" --timing-jsonl "$OUT/timing.jsonl" ${SERVER_ARGS:-}
 ) > "$OUT/policy_server.log" 2>&1 &
 SERVER=$!
 trap 'kill $SERVER 2>/dev/null' EXIT
