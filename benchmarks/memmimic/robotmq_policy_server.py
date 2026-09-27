@@ -153,6 +153,8 @@ class MemMimicPolicyServer:
         self.memory_ablation = "none"
         self.action_samples = 1
         self.dump_dir = None
+        # dim -> value written into the action history instead of the model's raw output (see --history-fixed-dims)
+        self.history_fixed_dims: dict[int, float] = {}
 
         self.server = robotmq.RMQServer("policy_server", endpoint)
         for topic in ("new_checkpoint_loaded", "eval_config"):
@@ -315,8 +317,11 @@ class MemMimicPolicyServer:
             from openwam.dataloader.utils.normalization import apply_normalization
 
             # The simulator executes the first exec_horizon commands of this chunk before the next request.
+            executed = actions[: self.exec_horizon].copy()
+            for d, v in self.history_fixed_dims.items():
+                executed[:, d] = v
             st.setdefault("executed", []).append(
-                apply_normalization(actions[: self.exec_horizon], self._action_stats, self._norm_mode).astype(np.float32)
+                apply_normalization(executed, self._action_stats, self._norm_mode).astype(np.float32)
             )
         return openwam10_to_gmp10(actions)
 
@@ -410,6 +415,14 @@ def main() -> None:
         choices=["none", "anchor_only", "shuffle", "zero_actions"],
         help="eval-time memory ablation: drop the history (anchor only), shuffle its chunk order, or zero the action history",
     )
+    ap.add_argument(
+        "--history-fixed-dims",
+        default="",
+        help="action history: write these OpenWAM-10 dims as fixed values instead of the model's raw output, e.g. "
+        "'0=0.1,2=0.365,9=0.08' for push_cube (x / z / gripper are constant in every recorded command and the sim "
+        "only moves y). Delta models normalize the history with the state stats, whose x / z / gripper ranges are "
+        "sub-mm, so raw output jitter would otherwise be clipped to +-1 there.",
+    )
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     server = MemMimicPolicyServer(
@@ -425,7 +438,13 @@ def main() -> None:
     server.memory_ablation = args.memory_ablation
     server.action_samples = max(1, int(args.action_samples))
     server.dump_dir = args.dump_dir
-    logger.info("memory ablation: %s | action samples averaged: %d", server.memory_ablation, server.action_samples)
+    for item in filter(None, (x.strip() for x in args.history_fixed_dims.split(","))):
+        d, v = item.split("=")
+        server.history_fixed_dims[int(d)] = float(v)
+    logger.info(
+        "memory ablation: %s | action samples averaged: %d | history fixed dims: %s",
+        server.memory_ablation, server.action_samples, server.history_fixed_dims or "none",
+    )
     server.run()
 
 
