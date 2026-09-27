@@ -32,6 +32,7 @@ from openwam.model.architectures.utils.memory_layout import (
     bool_mask_to_additive,
     build_gist_gate_selector,
     build_memory_joint_mask,
+    build_memory_reader_mask,
 )
 
 if TYPE_CHECKING:
@@ -343,9 +344,30 @@ class DualSystemMoTDriver:
         s_action = payload.x_action.shape[1]
 
         memory_layout = vstate.extras.get("memory_layout")
+        memory_stream = vstate.extras.get("memory_stream")
         gate_selector = None
         gist_gate = None
-        if memory_layout is not None:
+        if memory_stream is not None:
+            # Memory-OpenWAM Phase 2: the memory prefix is a per-layer KV cache (no query rows);
+            # rows [window | action] x cols [cached memory | window | action], sliced from the
+            # training mask. Built once per request and reused by its denoising steps.
+            mem_cfg = dict(vstate.extras.get("memory_mask_cfg") or {})
+            gist_gate = vstate.extras.get("memory_gist_gate")
+            key = (s_action, self.attention_mask_mode, gist_gate is not None)
+            cached = memory_stream.reader_masks.get(key)
+            if cached is None:
+                cached = build_memory_reader_mask(
+                    memory_stream.layout,
+                    s_action,
+                    memory_stream.key_index,
+                    mode=self.attention_mask_mode,
+                    f_cur_reads_memory=bool(mem_cfg.get("f_cur_reads_memory", False)),
+                    recent_kv=bool(mem_cfg.get("recent_kv", False)),
+                    with_gate=gist_gate is not None,
+                )
+                memory_stream.reader_masks[key] = cached
+            attn_mask, gate_selector = cached
+        elif memory_layout is not None:
             # Memory-OpenWAM: role-aware joint mask over
             # [memory prefix | window | action]; per sample (B, 1, S, S).
             mem_cfg = dict(vstate.extras.get("memory_mask_cfg") or {})

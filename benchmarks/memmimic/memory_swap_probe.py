@@ -62,6 +62,7 @@ def main() -> None:
     ap.add_argument("--pushes", type=int, nargs="+", default=[2, 4, 6], help="1-based push indices to probe")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--denoise-steps", type=int, default=None)
+    ap.add_argument("--shift", type=float, default=None, help="override the action-stream alpha-shift of the denoise schedule")
     ap.add_argument("--frame-offset-npy", default=None, help="(H, W, 3) float offset added to every dataset frame (rendering-shift test)")
     ap.add_argument("--n-seeds", type=int, default=1, help="repeat 'own' with this many seeds: sampling spread of the push speed")
     args = ap.parse_args()
@@ -143,6 +144,8 @@ def main() -> None:
                     "prompt": server.prompt, "first_frame_image": [cur], "proprio": proprio, "seed": seed,
                     "memory_video": list(mem[: c * F + 1]), "memory_times": times, "memory_context_index": c,
                 }
+                if args.shift is not None:
+                    cond["shift"] = float(args.shift)
                 if server.action_history:  # the history's own executed commands travel with its frames
                     cond["memory_actions"] = memory_action_history(src["act_norm"][: H * c], times, H)
                 raw = np.asarray(server.engine.generate(cond)["actions"], dtype=np.float32)

@@ -151,6 +151,36 @@ class ActionState:
     payload: Optional[Any] = None
 
 
+def perturb_action_history(acts: torch.Tensor, times: list, mem_cfg) -> torch.Tensor:
+    """Train-time action-history perturbation (anti-copycat): ``acts`` is ``(B, S, steps, D)`` normalized.
+
+    Real slots (not the anchor at time 0, not padding) get a per-slot offset and a per-slot linear drift over
+    the slot's steps; with probability ``action_history_dropout`` a sample's whole history is zeroed.
+    """
+    off, drift, drop = (
+        float(getattr(mem_cfg, "action_history_noise_offset", 0.0) or 0.0),
+        float(getattr(mem_cfg, "action_history_noise_drift", 0.0) or 0.0),
+        float(getattr(mem_cfg, "action_history_dropout", 0.0) or 0.0),
+    )
+    if off <= 0 and drift <= 0 and drop <= 0:
+        return acts
+    B, S, T, D = acts.shape
+    real = torch.zeros(B, S, dtype=torch.bool, device=acts.device)
+    for b, t in enumerate(times):
+        for i, ti in enumerate(t):
+            real[b, i] = int(ti) > 0
+    out = acts
+    if off > 0 or drift > 0:
+        ramp = torch.linspace(-0.5, 0.5, T, device=acts.device, dtype=acts.dtype).view(1, 1, T, 1)
+        noise = torch.randn(B, S, 1, D, device=acts.device, dtype=acts.dtype) * off
+        noise = noise + torch.randn(B, S, 1, D, device=acts.device, dtype=acts.dtype) * drift * ramp
+        out = out + noise * real.view(B, S, 1, 1).to(acts.dtype)
+    if drop > 0:
+        keep = (torch.rand(B, device=acts.device) >= drop).to(acts.dtype).view(B, 1, 1, 1)
+        out = out * keep
+    return out
+
+
 class BaseWAMArchitecture(ABC, nn.Module):
     """Base class for WAM architecture variants.
 
@@ -326,6 +356,9 @@ class BaseWAMArchitecture(ABC, nn.Module):
             forward_inputs["memory_latents"] = torch.where(select.view(B, 1, T, 1, 1), mixed, latents)
         if mem_cfg.memory_dropout > 0:
             forward_inputs["memory_reader_sees_memory"] = torch.rand(B, device=latents.device) >= mem_cfg.memory_dropout
+        acts = forward_inputs.get("memory_actions")
+        if acts is not None:
+            forward_inputs["memory_actions"] = perturb_action_history(acts, times, mem_cfg)
 
     @staticmethod
     def _cfg_get(cfg, key, default=None):

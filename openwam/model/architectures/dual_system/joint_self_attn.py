@@ -211,7 +211,11 @@ class DualSystemSelfAttnArchitecture(BaseWAMArchitecture):
         # memory_context_index) arrive in ``pipeline_inputs`` from prepare_inputs
         # (training) or generate() (deploy).
         memory_reader_sees_memory = pipeline_inputs.pop("memory_reader_sees_memory", None)
-        has_memory_inputs = pipeline_inputs.get("memory_latents") is not None
+        # memory_stream (deploy KV cache, Phase 2) replaces memory_latents; see utils/memory_stream.py.
+        has_memory_stream = pipeline_inputs.get("memory_stream") is not None
+        has_memory_inputs = pipeline_inputs.get("memory_latents") is not None or has_memory_stream
+        if has_memory_stream and memory_reader_sees_memory is not None:
+            raise ValueError("memory dropout is a training-time augmentation; memory_stream is deploy-only.")
         if has_memory_inputs and self.memory is None:
             raise RuntimeError("memory_latents were provided but memory.enabled is false for this architecture.")
         if self.memory is not None and not has_memory_inputs:
@@ -230,6 +234,8 @@ class DualSystemSelfAttnArchitecture(BaseWAMArchitecture):
             vstate.extras["memory_reader_sees_memory"] = memory_reader_sees_memory
 
         if noisy_actions is None or ab is None:
+            if has_memory_stream:
+                raise NotImplementedError("memory_stream needs the joint video-action loop.")
             if has_memory_inputs:
                 from openwam.model.architectures.utils.memory_layout import (
                     bool_mask_to_additive,

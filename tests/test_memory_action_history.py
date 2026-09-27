@@ -61,3 +61,22 @@ def test_reader_payload_uses_recorded_commands():
     rec = pose10_from_xyz_wxyz(g["action0_tcp_xyz_wxyz"][:], g["action0_gripper_width"][:])
     rec = apply_normalization(rec, ds._action_stats, ds._normalize_mode)
     np.testing.assert_allclose(acts, memory_action_history(rec[: 16 * c], payload["memory_times"], 16), atol=1e-6)
+
+
+def test_train_time_history_perturbation_spares_anchor_and_padding():
+    from openwam.model.architectures.base import perturb_action_history
+
+    cfg = MemoryConfig(enabled=True, action_history=True, action_history_noise_offset=0.05,
+                       action_history_noise_drift=0.05, action_history_dropout=0.0)
+    acts = torch.zeros(2, 4, 16, 10)
+    times = [[0, 1, 2, 3], [0, 1]]  # sample 1 has two padded slots
+    out = perturb_action_history(acts, times, cfg)
+    assert torch.count_nonzero(out[:, 0]) == 0  # anchor untouched
+    assert torch.count_nonzero(out[1, 2:]) == 0  # padding untouched
+    assert torch.count_nonzero(out[0, 1:]) > 0 and torch.count_nonzero(out[1, 1]) > 0
+    step_diff = out[0, 1, 1:] - out[0, 1, :-1]  # drift is linear within a slot
+    assert torch.allclose(step_diff, step_diff[:1].expand_as(step_diff), atol=1e-6)
+    dropped = perturb_action_history(torch.ones(3, 2, 16, 10), [[0, 1]] * 3,
+                                     MemoryConfig(enabled=True, action_history=True, action_history_dropout=1.0))
+    assert torch.count_nonzero(dropped) == 0
+    assert perturb_action_history(acts, times, MemoryConfig(enabled=True)) is acts

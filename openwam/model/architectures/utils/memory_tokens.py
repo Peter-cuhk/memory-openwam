@@ -36,6 +36,12 @@ class MemoryConfig:
     action_history: bool = False
     action_history_steps: int = 16  # control steps per latent (video_stride * 4)
     action_history_dim: int = 10  # raw normalized action width fed by the reader / server
+    # Train-time perturbation of the action history (anti-copycat, 2026-09-26): per slot a constant offset
+    # ~N(0, offset) and a linear drift ~N(0, drift) over the slot's steps (a speed error), in normalized units;
+    # plus dropping a sample's whole action history with probability `action_history_dropout`.
+    action_history_noise_offset: float = 0.0
+    action_history_noise_drift: float = 0.0
+    action_history_dropout: float = 0.0
 
     def __post_init__(self) -> None:
         if self.gist_tokens <= 0:
@@ -48,6 +54,10 @@ class MemoryConfig:
             raise ValueError("memory.clean_noise_prob must be in [0, 1].")
         if self.clean_noise_scale < 0.0:
             raise ValueError("memory.clean_noise_scale cannot be negative.")
+        if min(self.action_history_noise_offset, self.action_history_noise_drift) < 0.0:
+            raise ValueError("memory.action_history_noise_* cannot be negative.")
+        if not 0.0 <= self.action_history_dropout <= 1.0:
+            raise ValueError("memory.action_history_dropout must be in [0, 1].")
 
     def mask_cfg(self) -> dict:
         return {"recent_kv": bool(self.recent_kv), "f_cur_reads_memory": bool(self.f_cur_reads_memory)}

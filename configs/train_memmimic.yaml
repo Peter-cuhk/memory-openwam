@@ -31,6 +31,9 @@ model:
       clean_noise_prob: 0.5
       clean_noise_scale: 0.3
       action_history: false       # GMP-style: embed each slot's executed commands into its gists (needs dataloader.memory_action_history)
+      action_history_noise_offset: 0.0   # train-time per-slot offset on the history (normalized units)
+      action_history_noise_drift: 0.0    # train-time per-slot linear drift (speed error)
+      action_history_dropout: 0.0        # train-time p(drop a sample's whole action history)
 
 training:
   debug: false

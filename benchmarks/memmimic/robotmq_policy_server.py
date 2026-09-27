@@ -153,6 +153,15 @@ class MemMimicPolicyServer:
         self.memory_ablation = "none"
         self.action_samples = 1
         self.dump_dir = None
+        # dim -> value written into the action history instead of the model's raw output (see --history-fixed-dims)
+        self.history_fixed_dims: dict[int, float] = {}
+        # Phase 2 (memory-openwam/docs/07): "recompute" re-encodes the history and re-runs the memory
+        # prefix at every denoising step (the original path); "prefix_once" runs it once per request;
+        # "streaming" keeps per-episode K/V and writes one latent per request. stream_vae encodes only
+        # the newly completed chunk (always on for the two KV modes).
+        self.memory_inference = "recompute"
+        self.stream_vae = False
+        self.timing_path = None
 
         self.server = robotmq.RMQServer("policy_server", endpoint)
         for topic in ("new_checkpoint_loaded", "eval_config"):
@@ -208,6 +217,29 @@ class MemMimicPolicyServer:
             },
         }
 
+    def configure_memory_inference(self, mode: str, *, stream_vae: bool = False, timing_path: str | None = None) -> None:
+        if mode == "auto":
+            # Evaluation default (2026-09-27): the validated streaming path whenever it applies
+            # (docs/07 V1-V3: E12 84 vs 85/100, 0.43 s/request), otherwise the original recompute
+            # path exactly as before (no memory, eval-time ablation, or memory.action_history).
+            if self.memory_enabled and self.memory_ablation == "none" and not self.action_history:
+                mode = "streaming"
+            else:
+                mode, stream_vae = "recompute", False
+        if mode not in ("recompute", "prefix_once", "streaming"):
+            raise ValueError(f"unknown memory inference mode {mode!r}")
+        if mode != "recompute" or stream_vae:
+            if not self.memory_enabled:
+                raise ValueError("--memory-inference / --stream-vae need a memory checkpoint.")
+            if self.memory_ablation != "none":
+                raise ValueError("memory ablations run on the recompute path only (they reorder raw frames).")
+        if mode != "recompute" and self.action_history:
+            raise NotImplementedError("the KV modes do not support memory.action_history.")
+        self.memory_inference = mode
+        self.stream_vae = bool(stream_vae or mode != "recompute")
+        self.timing_path = timing_path
+        self.episodes.clear()
+
     def _to_pil(self, frames: np.ndarray) -> list:
         """``(n, 3, H, W)`` or ``(n, H, W, 3)`` uint8/float -> list of resized RGB PIL."""
         frames = np.asarray(frames)
@@ -232,8 +264,33 @@ class MemMimicPolicyServer:
             self.episodes[episode_idx] = st
         return st
 
+    def _encode_history(self, st: dict, c: int):
+        """Streaming VAE: encode the chunks completed since the last request (anchor first) into the
+        episode's MemoryKVStream, which also holds the latents for the recompute + stream_vae path."""
+        from openwam.deploy.streaming_vae import StreamingVAEEncoder
+        from openwam.model.architectures.utils.memory_stream import MemoryKVStream
+
+        if "kv" not in st:
+            mode = "prefix_once" if self.memory_inference == "recompute" else self.memory_inference
+            st["kv"] = MemoryKVStream(mode)
+            st["vae"] = StreamingVAEEncoder(self.engine.architecture.video_backbone)
+        kv, vae, F = st["kv"], st["vae"], self.frames_per_latent
+        t0 = time.time()
+        while len(kv.latents) <= c:
+            k = len(kv.latents)
+            chunk = st["frames"][:1] if k == 0 else st["frames"][1 + F * (k - 1) : 1 + F * k]
+            kv.append_latent(vae.append(chunk))
+        if self._torch.cuda.is_available():
+            self._torch.cuda.synchronize()
+        st["t_vae"] = time.time() - t0
+        return kv
+
     def _infer_one(self, episode_idx: int, frames: list, pose10_gmp: np.ndarray) -> np.ndarray:
+        t_start = time.time()
+        if self.timing_path and self._torch.cuda.is_available():
+            self._torch.cuda.reset_peak_memory_stats()
         st = self._episode_state(episode_idx)
+        st["t_vae"] = 0.0
         if st["n_req"] == 0:
             st["frames"] = [frames[-1]]  # initial observations are copies of s_0
         else:
@@ -270,7 +327,16 @@ class MemMimicPolicyServer:
                 mem_frames = mem_frames[:1] + [f for k in perm for f in chunks[k]]
                 if executed:
                     executed = [executed[k] for k in perm]
-            conditions.update(memory_video=mem_frames, memory_times=times, memory_context_index=c)
+            if self.memory_inference == "recompute" and not self.stream_vae:
+                conditions.update(memory_video=mem_frames, memory_times=times, memory_context_index=c)
+            else:
+                kv = self._encode_history(st, c)
+                if self.memory_inference == "recompute":
+                    conditions.update(
+                        memory_latents=kv.latents_at(list(range(c + 1))), memory_times=times, memory_context_index=c
+                    )
+                else:
+                    conditions.update(memory_stream=kv, memory_times=times, memory_context_index=c)
             if self.action_history:
                 from openwam.dataloader.memmimic import memory_action_history
 
@@ -315,9 +381,28 @@ class MemMimicPolicyServer:
             from openwam.dataloader.utils.normalization import apply_normalization
 
             # The simulator executes the first exec_horizon commands of this chunk before the next request.
+            executed = actions[: self.exec_horizon].copy()
+            for d, v in self.history_fixed_dims.items():
+                executed[:, d] = v
             st.setdefault("executed", []).append(
-                apply_normalization(actions[: self.exec_horizon], self._action_stats, self._norm_mode).astype(np.float32)
+                apply_normalization(executed, self._action_stats, self._norm_mode).astype(np.float32)
             )
+        if self.timing_path:
+            import json
+
+            rec = {
+                "episode": int(episode_idx),
+                "request": int(st["n_req"]),
+                "ctx": int(conditions.get("memory_context_index", 0)),
+                "mode": self.memory_inference,
+                "stream_vae": bool(self.stream_vae or self.memory_inference != "recompute"),
+                "t_total": time.time() - t_start,
+                "t_vae_stream": float(st.get("t_vae", 0.0)),
+            }
+            if self._torch.cuda.is_available():
+                rec["peak_mem_gb"] = self._torch.cuda.max_memory_allocated() / 2**30
+            with open(self.timing_path, "a") as fh:
+                fh.write(json.dumps(rec) + "\n")
         return openwam10_to_gmp10(actions)
 
     def to_absolute(self, actions: np.ndarray, proprio_openwam10: np.ndarray) -> np.ndarray:
@@ -405,6 +490,24 @@ def main() -> None:
     ap.add_argument("--dump-dir", default=None, help="debug: save inputs/outputs of the first requests of episodes 0-2")
     ap.add_argument("--action-samples", type=int, default=1, help="average this many sampled chunks per request")
     ap.add_argument(
+        "--memory-inference",
+        default="recompute",
+        choices=["recompute", "prefix_once", "streaming", "auto"],
+        help="memory prefix at inference (docs/07): recompute every denoising step (original), once per request, "
+        "a per-episode KV stream, or auto (= streaming unless the checkpoint has no memory / uses action history / "
+        "an eval-time ablation is requested, in which case recompute)",
+    )
+    ap.add_argument(
+        "--history-fixed-dims",
+        default="",
+        help="action history: write these OpenWAM-10 dims as fixed values instead of the model's raw output, e.g. "
+        "'0=0.1,2=0.365,9=0.08' for push_cube (x / z / gripper are constant in every recorded command and the sim "
+        "only moves y). Delta models normalize the history with the state stats, whose x / z / gripper ranges are "
+        "sub-mm, so raw output jitter would otherwise be clipped to +-1 there.",
+    )
+    ap.add_argument("--stream-vae", action="store_true", help="encode only new history chunks (implied by the KV modes)")
+    ap.add_argument("--timing-jsonl", default=None, help="append per-request timing / peak memory records here")
+    ap.add_argument(
         "--memory-ablation",
         default="none",
         choices=["none", "anchor_only", "shuffle", "zero_actions"],
@@ -425,7 +528,15 @@ def main() -> None:
     server.memory_ablation = args.memory_ablation
     server.action_samples = max(1, int(args.action_samples))
     server.dump_dir = args.dump_dir
-    logger.info("memory ablation: %s | action samples averaged: %d", server.memory_ablation, server.action_samples)
+    for item in filter(None, (x.strip() for x in args.history_fixed_dims.split(","))):
+        d, v = item.split("=")
+        server.history_fixed_dims[int(d)] = float(v)
+    server.configure_memory_inference(args.memory_inference, stream_vae=args.stream_vae, timing_path=args.timing_jsonl)
+    logger.info(
+        "memory ablation: %s | action samples averaged: %d | history fixed dims: %s | memory inference: %s (stream VAE %s)",
+        server.memory_ablation, server.action_samples, server.history_fixed_dims or "none",
+        server.memory_inference, server.stream_vae,
+    )
     server.run()
 
 
